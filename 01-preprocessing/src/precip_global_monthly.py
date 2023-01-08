@@ -67,7 +67,7 @@ if __name__ == '__main__':
             in_radius = row.location_accuracy > 0
             if in_radius:
                 radius = row.location_accuracy / 111.5 # convert km to degrees
-                clip_radius = int(np.floor(radius * 20)) # convert degrees to grid
+                clip_radius = int(np.floor(radius * 20)) # convert deg to grid
 
                 # Clip
                 event_precip = precip.isel(
