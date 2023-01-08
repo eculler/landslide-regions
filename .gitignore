@@ -1,0 +1,25 @@
+# Mac stuff
+*.DS_Store
+
+# RStudio stuff
+*Icon*
+*.Rproj*
+*.RHistory*
+
+# Only track text files
+*.png
+*.docx
+*.pdf
+*.zip
+*.qgs
+*.qgd
+01-preprocessing/validate/*
+
+# Don't upload data files
+00-data/*
+02-analysis/rds/*
+
+# Don't upload paper revisions
+04-paper/revisions/*
+04-paper/proofs/*
+04-paper/diffs/*

@@ -1,0 +1,84 @@
+project_id: modis-burned-area
+log_level: !!python/name:logging.DEBUG
+verbose: true
+base_dir: /lsmutils
+temp_dir: tmp
+nprocesses: 2
+
+in:
+  burned-area-hdf: !Regex
+    dimensions:
+      - yearmonth
+    dirname: /lsmutils/data/FIRE_MODIS/hdf
+    filename_re: 'MCD64A1.A(?P<yearmonth>\d{7}).(?P<granule>h\d+v\d+).006.(?P<production_date>\d+)'
+    filename: 'MCD64A1.A{yearmonth}.{granule}.006.{production_date}'
+    default_ext: hdf
+    variable: 'MOD_Grid_Monthly_500m_DB_BA:Burn Date'
+  burned-area-tif: !Regex
+    dimensions:
+      - yearmonth
+    dirname: /lsmutils/out/tif
+    filename_re: 'MCD64A1.A(?P<yearmonth>\d{7}).(?P<granule>h\d+v\d+).(?P<i>\d+)'
+    filename: 'MCD64A1.A{yearmonth}.{granule}.{i}'
+    default_ext: tif
+cases:
+  base: !BaseCase {}
+
+scripts: {}
+
+sequence: !OpSequence
+  operations:
+    # - !Operation
+    #   name: convert-filetype
+    #   dims:
+    #     - yearmonth
+    #     - granule
+    #   in:
+    #     input-ds: burned-area-hdf
+    #     filetype: tif
+    #   out:
+    #     converted: burned-area-tif
+    - !Operation
+      name: mosaic
+      dims:
+        - yearmonth
+      in:
+        input-ds: burned-area-tif
+      out:
+        merged: burned-area-merged
+    - !Operation
+      name: reproject-raster
+      dims:
+        - yearmonth
+      in:
+        input-ds: burned-area-merged
+        srs: 'EPSG:54032'
+      out:
+        reprojected: burned-area-aed
+    - !Operation
+      name: convert-filetype
+      dims:
+        - yearmonth
+      in:
+        input-ds: burned-area-aed
+        filetype: nc
+      out:
+        converted: burned-area-nc
+
+structure: !CaseDirectoryStructure
+  idstr: modis-burn
+  paths:
+    out:
+      tif:
+        burned-area-tif: !DataList
+          filename: MCD64A1.A{yearmonth}.{granule}
+      global:
+        burned-area-merged: !DataList
+          filename: MCD64A1.A{yearmonth}
+      aed:
+        burned-area-aed: !DataList
+          filename: MCD64A1.A{yearmonth}
+      netcdf:
+        burned-area-nc: !DataList
+          filename: MCD64A1.A{yearmonth}
+          variable: BurnDate

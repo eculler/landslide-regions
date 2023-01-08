@@ -1,0 +1,17 @@
+name: gisenv
+channels:
+  - conda-forge
+dependencies:
+  - bokeh
+  - dask
+  - fiona
+  - geopandas
+  - matplotlib
+  - netcdf4
+  - pandas
+  - pynio
+  - pyproj
+  - rtree
+  - scipy
+  - shapely
+  - xarray

@@ -1,0 +1,2 @@
+$ENV{'TEXINPUTS'}='./copernicus//:' . $ENV{'TEXINPUTS'};
+$ENV{'BSTINPUTS'}='./copernicus//:' . $ENV{'BSTINPUTS'};

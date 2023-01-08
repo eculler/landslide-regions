@@ -1,0 +1,67 @@
+project_id: daymet
+basin_id:
+log_level: !!python/name:logging.DEBUG
+verbose: true
+base_dir: /Users/elsaculler/Documents/landslide/regions
+temp_dir: tmp
+
+
+in:
+  bbox: &bbox !BBox
+    llc: !Coord
+      lon: -125
+      lat: 32
+    urc: !Coord
+      lon: -114
+      lat: 43
+
+  utc-offset: -8
+
+  start: 1980-01-01 00:00:00.00
+
+  end: 2018-12-31 00:00:00.00
+
+  daymet: !File
+    dirname: downloads
+    filename: daymet
+    default_ext: nc
+    url: !PathSegments
+      segments:
+        - 'https://thredds.daac.ornl.gov/thredds/ncss/ornldaac/1328/{year}/'
+        - 'daymet_v3_prcp_{year}_na.nc4'
+
+scripts: {}
+
+cases:
+  base: !BaseCase {}
+
+sequence: !OpSequence
+  operations:
+    - !Operation
+      name: download-thredds
+      in:
+        ds: daymet
+        vars:
+          - lat
+          - lon
+          - prcp
+        bbox: *bbox
+        start: start
+        end: end
+        chunk: '1YS'
+      out:
+        chunks: daymet-chunks
+        data: daymet
+
+
+
+structure: !CaseDirectoryStructure
+  idstr: stat
+  paths:
+    data:
+      daymet:
+        prcp:
+          daymet-chunks: !File
+            filename: chunk
+          daymet: !File
+            filename: daymet

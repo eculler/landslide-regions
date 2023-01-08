@@ -1,0 +1,32 @@
+Steps for precipitation processing
+==================================
+
+Clip to lat/lon boundaries:
+ls ~/Documents/landslide/data/PRECIP_CHIRPS/chirps-v2.0.*.days_p05.nc | xargs basename | xargs -I {} ncks -d longitude,-125.,-114. -d latitude,32.,43. ~/Documents/landslide/data/PRECIP_CHIRPS/{} {}
+
+Concatenate all years together:
+ls | xargs -I {} ncks -O --mk_rec_dmn time {} {}
+ncrcat $(ls) chirps-v2.0.days_p05.nc
+
+Remove zeros (set to fill value to ignore for percentiles
+ncap2 -s 'where(precip==0) precip=-9999.' chirps-v2.0.days_p05.nc chirps-v2.0.days_p05_no0.nc
+
+Calculate percentiles:
+cdo timmin chirps-v2.0.days_p05_no0.nc chirps-v2.0.days_p05_no0_min.nc
+cdo timmax chirps-v2.0.days_p05_no0.nc chirps-v2.0.days_p05_no0_max.nc
+seq 0 1 99 | xargs -I {} cdo timpctl,{} chirps-v2.0.days_p05_no0.nc chirps-v2.0.days_p05_no0_min.nc chirps-v2.0.days_p05_no0_max.nc percentile_no0/chirps-v2.0.days_p05_no0_pctl{}.nc
+
+Concatenate percentiles:
+Add leading zeros so files are in the right order
+cd percentile_no0
+ls | xargs -I {} ncecat -O -u percentile {} {}
+ls | xargs -I {} ncks -O --mk_rec_dmn percentile {} {}
+ncrcat $(ls) chirps-v2.0.days_p05_pctl.nc
+
+Add the max as 100:
+ncecat -O -u percentile ../chirps-v2.0.days_p05_no0_max.nc chirps-v2.0.days_p05_no0_pctl100.nc
+ncks -O --mk_rec_dmn percentile chirps-v2.0.days_p05_no0_pctl100.nc chirps-v2.0.days_p05_no0_pctl100.nc
+ncrcat chirps-v2.0.days_p05_pctl.nc chirps-v2.0.days_p05_no0_pctl100.nc chirps-v2.0.days_p05_pctl.nc
+
+Calculate 7-day rolling sum:
+cdo runsum,7 chirps-v2.0.days_p05.nc chirps-v2.0.days_p05_7d.nc

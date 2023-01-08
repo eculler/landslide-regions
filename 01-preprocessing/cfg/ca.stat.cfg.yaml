@@ -1,0 +1,59 @@
+project_id: stat
+basin_id: ca
+log_level: !!python/name:logging.INFO
+verbose: true
+base_dir: /Users/elsaculler/Documents/landslide/stat
+temp_dir: /tmp
+
+input:
+  dem: !Tiles
+    dirname: /Volumes/LabShare/Global/SRTMv3/hgt
+    bbox: [-124, 32, -115, 43]
+    filename_fmt: '{cardinal_lat}{abs_min_lat}{cardinal_lon}{abs_min_lon:03d}'
+    default_ext: hgt
+  ksat0_5: !File
+    dirname: ksat/p95/0_5
+    filename: &soilfiles
+      - lat3334_lon-121-120
+      - lat3334_lon-120-119
+      - lat3334_lon-119-118
+      - lat3435_lon-121-120
+      - lat3435_lon-120-119
+      - lat3435_lon-119-118
+      - lat3536_lon-121-120
+      - lat3536_lon-120-119
+      - lat3536_lon-119-118
+    default_ext: tif
+  res: !Coord {x: 0.05, y: 0.05}
+  grid-res: !Coord {x: 1.0, y: 1.0}
+  bbox: [-121.0, 33.0, -119.0, 35.0]
+  soil-min-depth: !!float 0.1
+  soil-max-depth: !!float 10.0
+cases:
+  base: !BaseCase {}
+    
+operations:
+  - operation: merge
+    in:
+      raster-list: dem
+    out: 
+      merged: merged-dem
+  - operation: slope
+    in:
+      elevation-ds: merged-dem
+    out:
+      slope: slope
+  - operation: seq::align
+    in:
+      input: slope
+      res: res
+      grid-res: grid-res
+      bbox: bbox
+      algorithm: max
+    out:
+      scaled-raster: scaled-slope
+structure: !CaseDirectoryStructure
+  idstr: hotspots
+  paths:
+    '{basin_id}':
+      '{case_id}':

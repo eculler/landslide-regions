@@ -1,0 +1,28 @@
+Steps for soil moisture processing
+==================================
+
+Extract the desired variables (soil moisture and snow melt)
+seq 2007 1 2018 | xargs -I {} find /Volumes/LabShare/NLDAS2/NOAH/{} -type f -name '*.nc' | xargs -I {} sh -c 'ncks -v var86_SOILM,var99_SNOM {} $(basename {})'
+
+Split into directories based on dates
+mkdir noah/daily
+ls noah | ggrep -Po '\d{8}' | xargs -I {} sh -c 'mkdir -p noah/daily/{} && mv noah/NLDAS_NOAH0125_H..A{}.*.nc noah/daily/{}/'
+
+Concatenate into daily files
+find daily -type file | xargs -I {} ncecat -O -u hour {} {}
+find daily -type file | xargs -I {} ncks -O --mk_rec_dmn hour {} {}
+ls daily | xargs -I {} sh -c 'ncrcat $(find daily/{} -type file)  daily_cat/NLDAS_NOAH0125_H.{}.nc'
+
+Clip to lat/lon bounds
+ls daily | xargs -I {} ncks -d lon,-125.,-114. -d lat,32.,43. daily/{} daily_clip/{}
+
+Average values over hours
+ls daily_clip | xargs -I {} ncwa -a day daily_clip/{} daily_mean/{}
+
+Average values over depth
+ls daily_mean | xargs -I {} cdo vertmean daily_mean/{} daily_mean_all_layers/{}
+
+Concatenate along time
+cd daily_mean_all_layers
+ls | xargs -I {} ncks -O --mk_rec_dmn time {} {}
+ncrcat $(ls)  NLDAS_NOAH0125.nc

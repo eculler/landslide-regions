@@ -1,0 +1,55 @@
+project_id: ressed
+basin_id:
+log_level: !!python/name:logging.DEBUG
+verbose: true
+base_dir: /Users/elsaculler/Documents/thomas/matilija
+temp_dir: tmp
+
+
+in:
+  bbox: &bbox !BBox
+    llc: !Coord
+      lon: -125
+      lat: 32
+    urc: !Coord
+      lon: -114
+      lat: 43
+
+  utc-offset: -8
+
+  start: 1980-01-01 00:00:00.00
+
+  end: 2016-01-01 00:00:00.00
+
+  daymet: !File
+    dirname: downloads
+    filename: daymet
+    default_ext: nc
+    url: https://thredds.daac.ornl.gov/thredds/dodsC/ornldaac/1328/{year}
+
+scripts: {}
+
+cases:
+  base: !BaseCase {}
+
+sequence: !OpSequence
+  operations:
+    - !Operation
+      name: download-opendas
+      in:
+        ds: daymet
+        vars:
+          - swe
+        bbox: *bbox
+        start: start
+        end: end
+        chunk: '1Y'
+      out:
+        chunks: daymet-chunks
+        data: daymet
+
+
+
+structure: !CaseDirectoryStructure
+  idstr: stat
+  paths: {}

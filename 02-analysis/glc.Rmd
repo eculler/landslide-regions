@@ -1,0 +1,2214 @@
+---
+title: "A data-driven approach to evaluating landslide hazards"
+author: "Dr. Elsa Culler and Dr. Ben Livneh"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+
+# Handle cache manually
+knitr::opts_chunk$set(include = TRUE, 
+                      eval = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      results = 'show',
+                      cache = FALSE,
+                      cache.lazy = FALSE,
+                      fig.retina = 1)
+```
+
+```{r libraries, include=FALSE}
+# Analysis libraries
+library(broom)
+library(cluster)
+library(cowplot)
+library(furrr)
+library(grid)
+library(gtable)
+library(lubridate)
+library(maps)
+library(scales)
+library(sf)
+library(tigris)
+library(RColorBrewer)
+library(zoo)
+library(tidyverse)
+```
+
+
+
+# Data
+
+This study uses landslide, fire, and precipitation data to study the 
+antecedent precipitation of post-wildfire landslides. The impact of wildfire 
+on rainfall-triggered landslide susceptibility in a variety of global regions 
+is evaluated through a proxy of normalized precipitation.
+
+```{r data_management, include = F}
+clear.data <- function (variable.name, delete.rds = F) {
+  if (exists(variable.name)) {
+    rm(list = variable.name, envir = .GlobalEnv)
+  }
+  rds.path <- str_c('rds/', variable.name, '.Rds')
+  if (file.exists(rds.path) && delete.rds) {
+    #Delete file if it exists
+    file.remove(rds.path)
+  }
+}
+
+get.data <- function (variable.name, load.function, ..., 
+                      reload.from.rds = F, overwrite = F) {
+  rds.path <- str_c('rds/', variable.name, '.Rds')
+  # Remove existing data if desired
+  if (overwrite) {
+    clear.data(variable.name, delete.rds = T)
+  } 
+  # Remove only environment variable to reload Rds file
+  if (reload.from.rds) {
+    clear.data(variable.name, delete.rds = F)
+  }
+  
+  # If the variable doesn't exist (default)...
+  if (!exists(variable.name)) { 
+    # If the Rds file already exists...
+    if (file.exists(rds.path)) { 
+      # Read in the existing Rds file and assign the results to the variable
+      assign(variable.name, readRDS(rds.path), envir = .GlobalEnv)
+    # Otherwise it the Rds file doesn't exist
+    } else {
+      # Calculate the value from scratch and assign it to the variable...
+      data <- load.function(...)
+      assign(variable.name, data, envir = .GlobalEnv)
+      # and if the user wants to overwrite the rds (default)...
+      #store it to an Rds file
+      saveRDS(data, rds.path)
+    }
+  }
+}
+```
+
+## Data Filepaths
+
+Use this section to modify file paths if running the notebook on a different
+computer.
+```{r data_paths, class.source = 'fold.show'}
+# Project Directories
+data.dir <- file.path('..', '00-data')
+raw.data.dir <- file.path(data.dir, 'raw')
+processed.data.dir = file.path(data.dir, 'processed')
+
+figure.dir <- file.path('..', '03-figures')
+
+# Landslide data from the NASA Global Landslide Catalog
+slide.path <- file.path(raw.data.dir, 'glc', 'GLC20180821.csv')
+
+# Fire data from the MODIS Burned Area dataset
+modis.paths <- list.files(path = file.path(data.dir, "processed"),
+                          pattern = 'slide_modisburndate_[ns][ew].csv',
+                          full.names = T)
+
+# Precipitation data from CHIRPS
+precip.chirps.ww.path <-  file.path(processed.data.dir, 
+                                    "glc_precip_global.csv")
+precip.chirps.ww.monthly.path <- file.path(processed.data.dir, 
+                                           "glc_precip_global_monthly.csv")
+
+# Additional preciptiation data from Daymet for a limited region
+precip.daymet.ca.path <- file.path(processed.data.dir,
+                                   "glc_precip_daymet.csv")
+```
+
+## Data inclusion
+
+Include landslides with the following parameters:
+* Rainfall triggered
+```{r data_parameters_rainfall, class.source = 'fold-show'}
+rain.triggers <- c('rain', 'downpour', 'flooding', 'continuous_rain')
+```
+
+* Occurred within the time frame of the fire and precipitation datasets
+```{r data_parameters_dates, class.source = 'fold-show'}
+start.date <- lubridate::ymd('2007-01-01')
+end.date <- lubridate::ymd('2019-01-01')
+```
+
+* Occurred within the spatial extend of the fire and precipitation datasets
+```{r data_parameters_spatial, class.source = 'fold-show'}
+min.latitude <- -50
+max.latitude <- 50
+```
+
+* Location accuracy on par with precipitation resolution or more accurate
+```{r data_parameters_accuracy, class.source = 'fold-show'}
+min.location.accuracy <- '10km'
+```
+
+* MODIS Burned Area data should include an additional 3 years
+```{r data_parameters_modis, class.source = 'fold-show'}
+modis.start.date <- lubridate::ymd('20040101')
+modis.end.date <- lubridate::ymd('20190101')
+```
+
+* Wilcox tests between burned and unburned locations have the following parameters:
+```{r wilcox_parameters, class.source = 'fold-show'}
+wilcox.alternative <- 'less' # n - burned, m - unburned
+wilcox.alpha <- 0.05
+```
+
+## Study definitions
+
+* Study location parameters are applied using a set of functions to identify if data
+are included in the study.
+```{r location_inclusion_functions}
+# Identify if a location is in the global limits
+is.in.global.study <- function (x, y) { between(y, min.latitude, max.latitude) }
+
+# Identify if a location is in the CA/NV pilot study
+get.data('state.boundaries', tigris::states)
+boundaries <- subset(state.boundaries, STUSPS %in% c('CA', 'NV'))
+boundaries.df <- fortify(boundaries)
+is.in.ca.study <- function (x, y) {
+  bbox <- sf::st_bbox(subset(state.boundaries, STUSPS == 'CA'))
+  between(x, bbox$xmin, bbox$xmax) &
+    between(y, bbox$ymin, bbox$ymax)
+}
+```
+
+- Seasons are split in the Northern Hemisphere by:
+
+    Winter
+    : December-January-February
+    
+    Spring
+    : March-April-May
+    
+    Summer
+    : June-July-August
+    
+    Fall
+    : September-October-November
+
+- In the southern hemisphere, the split is shifted instead:
+
+    Winter
+    : June-July-August
+    
+    Spring
+    : September-October-November
+    
+    Summer
+    : December-January-February
+    
+    Fall
+    : March-April-May
+
+- A set of functions converts months and days-of-the-year to seasons.
+```{r season_functions}
+season.breaks <- c('spring'=59, 'summer'=151, 'fall'=243, 'winter'=334)
+yday.to.season <- function(yday, latitude) {
+    if (latitude > 0) {
+      case_when(
+        yday > season.breaks['winter'] ~ 'Winter',
+        yday > season.breaks['fall'] ~ 'Fall',
+        yday > season.breaks['summer'] ~ 'Summer',
+        yday > season.breaks['spring'] ~ 'Spring',
+        TRUE ~ 'Winter')
+    } else {
+      case_when(
+        yday > season.breaks['winter'] ~ 'Summer',
+        yday > season.breaks['fall'] ~ 'Spring',
+        yday > season.breaks['summer'] ~ 'Winter',
+        yday > season.breaks['spring'] ~ 'Fall',
+        TRUE ~ 'Summer')
+    }
+}
+
+month.to.season <- function (month, north) {
+  if (north) {
+    case_when(
+      month >= 12 ~ 'Winter',
+      month >= 9 ~ 'Fall',
+      month >= 6 ~ 'Summer',
+      month >= 3 ~ 'Spring',
+      TRUE ~ 'Winter')
+  } else {
+    case_when(
+      month >= 12 ~ 'Summer',
+      month >= 9 ~ 'Spring',
+      month >= 6 ~ 'Winter',
+      month >= 3 ~ 'Fall',
+      TRUE ~ 'Summer')
+  }
+}
+
+```
+
+```{r plot_colors, include=F}
+# Region colors
+region.plot.order <- c('All landslides',
+                       'California',
+                       'Intermountain West',
+                       'Pacific Northwest',
+                       'Central America',
+                       'Himalayas',
+                       'Southeast Asia')
+scale_region_values <- c('All landslides' = 'grey50',
+                         setNames(RColorBrewer::brewer.pal(6, 'Dark2'), 
+                                  region.plot.order[2:7]))
+scale_region_labels <- c('All landslides' = 'None',
+                         setNames(region.plot.order[2:7], 
+                                  region.plot.order[2:7]))
+scale_color_region <- scale_color_manual('Region', 
+                                         values = scale_region_values,
+                                         labels = scale_region_labels)
+scale_fill_region <- scale_fill_manual('Region', 
+                                       values = scale_region_values,
+                                       labels = scale_region_labels)
+
+scale_color_precip <- scale_color_distiller('Precipitation percentile', 
+                                            palette='BrBG', direction = 1,
+                                            guide = guide_colorbar(barwidth = unit(0.5, 'npc')))
+scale_fill_precip <- scale_fill_distiller('Precipitation percentile', 
+                                          palette='BrBG', direction = 1,
+                                          guide = guide_colorbar(barwidth = unit(0.5, 'npc')))
+
+# Fire colors
+burned.labels <- c('burned'='Burned', 'unburned'='Unburned')
+burned.colors <- c('burned' = '#d95f02', unburned = '#7570b3')
+scale_color_burned <- scale_color_manual('', 
+                                         values = burned.colors,
+                                         labels = burned.labels)
+scale_fill_burned <- scale_fill_manual('', 
+                                       values = burned.colors,
+                                       labels = burned.labels) 
+# Season
+scale_x_season <- scale_x_continuous(
+    breaks = season.breaks,
+    labels = c('Spring', 'Summer', 'Fall', 'Winter'))
+
+col.ocean <- 'lightskyblue1'
+```
+
+```{r plot_themes, include=F}
+theme_map <- list(
+  theme_bw(),
+  coord_quickmap(),
+  labs(x='', y='')
+)
+
+theme_global_map <- list(theme_map,
+                         borders(fill = 'grey90', size = 0.1),
+                         theme(panel.background = element_rect(fill=col.ocean), 
+                               panel.grid = element_blank(),
+                               axis.text = element_blank(),
+                               axis.ticks = element_blank(),
+                               plot.margin = unit(c(0,0,0,0), "null")),
+                         coord_quickmap(ylim = c(-60, 75), xlim = c(-180, 180))
+)
+theme_panel <- theme(panel.background = element_rect(fill=col.ocean), 
+                     panel.grid = element_blank(),
+                     axis.text = element_blank(),
+                     axis.ticks = element_blank(),
+                     plot.margin = unit(c(1,0,-1,0), "lines"),
+                     legend.position = 'null')
+theme_panel_legend <- theme(
+  legend.box.margin = margin(-1, 0, 1, 0),
+  legend.box.just = c(0, 0),
+  #legend.background = element_rect(color='black'), #debug
+  legend.position = 'bottom'
+)
+capitalize <- function(string) {
+  substr(string, 1, 1) <- toupper(substr(string, 1, 1))
+  string
+}
+```
+
+## Landslide data from the NASA Global Landslide Catalog
+
+```{r load_slides_raw}
+slide.pre.elimination <- readr::read_csv(slide.path)
+slide.pre.elimination
+```
+
+```{r load_slides}
+load.slides <- function (slide.path, 
+                         start.date, end.date, 
+                         is.in.global.study, 
+                         rain.triggers, 
+                         min.location.accuracy) {
+  # Define factor levels
+  ls.sizes <- c("small", "medium", "large", "very_large", "catastrophic")
+  ls.accuracy <- c("exact", "1km", "5km", "10km", 
+                   "25km", "50km", "100km", "250km")
+  
+  # Read data file and remove duplicates
+  slide.raw <- readr::read_csv(slide.path,
+    guess_max = 100000,
+    na = c("", "unknown", "--"),
+    col_types = cols(
+      landslide_size = readr::col_factor(ls.sizes, ordered=TRUE),
+      location_accuracy = readr::col_factor(ls.accuracy, ordered=TRUE),
+      landslide_trigger = readr::col_factor(NULL),
+      landslide_category = readr::col_factor(NULL),
+      landslide_setting = readr::col_factor(NULL),
+      country_code = readr::col_factor(NULL)
+    )
+  ) %>% 
+    dplyr::mutate(event_date = as_date(ymd_hm(event_date)),
+                  submitted_date = as_date(ymd_hm(submitted_date)),
+                  last_edited_date = as_date(ymd_hm(last_edited_date)))
+  slide.unique <- slide.raw  %>%
+    dplyr::group_by(event_date, latitude, longitude) %>%
+    dplyr::mutate(i = row_number()) %>%
+    dplyr::filter(i == 1) %>%
+    dplyr::select(-i) %>%
+    dplyr::ungroup()
+  
+  # Filter landslides to meet study parameters
+  slide.unique %>%
+    dplyr::filter(event_date >= start.date,
+                  event_date <= end.date,
+                  is.in.global.study(longitude, latitude),
+                  landslide_trigger %in% rain.triggers,
+                  location_accuracy <= min.location.accuracy) %>%
+    droplevels() %>%
+    dplyr::mutate(event_yday = yday(event_date),
+                  debris_flow = landslide_category %in% c('mudslide', 'debris flow'),
+                  season = factor(map2_chr(event_yday, latitude, 
+                                           ~yday.to.season(.x, .y)),
+                                  levels = c('Spring', 'Summer', 'Fall', 'Winter'),
+                                  ordered = T))
+}
+
+get.data('slide.all.precip', overwrite = F,
+         load.slides,
+         slide.path, start.date, end.date, 
+         is.in.global.study, rain.triggers,
+         min.location.accuracy)
+
+slide.all.precip %>%
+  dplyr::select(landslide_trigger, location_accuracy, latitude, event_date) %>%
+  summary()
+```
+## Precipitation data from CHIRPS and Daymet
+
+### Global CHIRPS data
+```{r load_chirps_all}
+load.precip.all <- function (precip.chirps.ww.path) {
+    precip.chirps.ww.raw <- read_csv(precip.chirps.ww.path,
+                                     col_types = cols(X1 = col_datetime(format = "%Y-%m-%d")))
+    precip.chirps.ww.raw %>%
+      dplyr::select(date=X1, OBJECTID, pctl=precip_pctl_7) %>%
+      dplyr::filter(OBJECTID %in% slide$OBJECTID) %>%
+      dplyr::mutate(window=7) %>%
+      dplyr::filter(!is.na(pctl)) # Remove NA values from beginning of data range
+}
+
+get.data('precip.chirps.ww.all', precip.chirps.ww.path)
+precip.chirps.ww.all
+```
+
+### Detailed global CHIRPS data close to the landslide
+```{r load_chirps_event}
+date.filter.precip <- function (raw, slide=slide.all.precip, pre=90, post=30) {
+  raw %>%
+    dplyr::right_join(slide %>% dplyr::select(OBJECTID, event_date), 
+                      by='OBJECTID') %>% 
+    dplyr::select(OBJECTID, dplyr::starts_with('precip_'), event_date, date) %>%
+    dplyr::mutate(date = lubridate::as_date(date),
+           days_before = as.integer(event_date - date)) %>%
+    dplyr::filter(days_before < pre, days_before > -post)
+}
+
+tidy.precip <- function (precip) {
+  precip %>% 
+    dplyr::select(OBJECTID, starts_with('precip_'), event_date, date) %>%
+    gather(key='variable', value='amount', starts_with('precip_')) %>%
+    separate(variable, into=c(NA, 'variable', 'window')) %>% 
+    dplyr::filter(variable=='pctl') %>%
+    dplyr::select(-variable, pctl=amount) %>%
+    dplyr::mutate(days_before = as.integer(event_date - date),
+           yday = yday(event_date - days(days_before)),
+           window = as.numeric(window)) %>%
+    dplyr::select(-event_date)
+}
+
+load.event.precip <- function (precip.chirps.ww.path) {
+    precip.chirps.ww.raw <- read_csv(precip.chirps.ww.path,
+                                     col_types  = readr::cols(X1 = col_datetime(format = "%Y-%m-%d")))
+    precip.chirps.ww.raw.filt <- precip.chirps.ww.raw %>%
+      dplyr::rename(date = X1) %>%
+      dplyr::filter(year(date) > 2003)
+    precip.chirps.ww.raw.filt2 <- precip.chirps.ww.raw.filt %>%
+      date.filter.precip 
+    precip.chirps.ww.raw.filt2 %>% 
+      tidy.precip
+}
+
+get.data('precip.chirps.ww.event', precip.chirps.ww.path)
+precip.chirps.ww.event
+```
+
+### Import Monthly CHIRPS data
+```{r load_chirps_monthly}
+load.precip.monthly <- function (monthly.path, slide) {
+  read_csv(precip.chirps.ww.monthly.path,
+           col_types = cols(X1 = col_date(format = '%Y-%m-%d'))) %>%
+    dplyr::transmute(OBJECTID, 
+                     year = year(X1), month = month(X1), 
+                     precip.mm=precip) %>%
+    dplyr::inner_join(slide %>% select(OBJECTID, latitude), by='OBJECTID') %>%
+    dplyr::mutate(north = latitude > 0) %>%
+    dplyr::group_by(north) %>%
+    dplyr::mutate(season = factor(month.to.season(month, north),
+                                  levels = c('Spring', 'Summer', 'Fall', 'Winter'),
+                                  ordered = T)) %>%
+    ungroup()
+}
+ 
+get.data('precip.chirps.ww.monthly', overwrite = F,
+         load.precip.monthly,
+         precip.chirps.ww.monthly.path,
+         slide.all.precip)
+
+precip.chirps.ww.seasonal.median <- precip.chirps.ww.monthly %>%
+  group_by(OBJECTID, year, season) %>%
+  summarize(precip.mm = sum(precip.mm)) %>%
+  ungroup() %>%
+  summarize(median = median(precip.mm)) %>%
+  pull(median)
+
+precip.chirps.ww.monthly
+```
+
+
+### Filter out landslides with zero precipitation
+```{r tally_excluded}
+precip.chirps.ww.event %>%
+  # Filter out sites with no precipitation data at all
+  filter(days_before==-1, window==7, !is.na(pctl)) %>%
+  # Filter out sites already excluded by landslide criteria
+  inner_join(slide.all.precip, by = 'OBJECTID') %>%
+  # Count numbers of zero and non-zero precipitation
+  group_by(precip = ifelse(pctl > 0, 'non.zero.precip', 'zero.precip')) %>%
+  tally() %>%
+  spread(key = precip, value = n) %>%
+  mutate(total = non.zero.precip + zero.precip,
+         percent.zero.precip = zero.precip / total)
+```
+
+```{r filter_slide_no_precip}
+filter.slide.precip <- function (slide.all.precip, precip.event) {
+  slide.all.precip %>%
+    dplyr::inner_join(precip.event %>% 
+                        filter(days_before==-1, window==7, !is.na(pctl)) %>%
+                        dplyr::filter(days_before==-1, window==7, pctl > 0)) %>%
+    dplyr::select(OBJECTID, latitude, longitude, event_date, event_yday, season,
+                  location_accuracy, 
+                  landslide_category, landslide_trigger, landslide_size,
+                  landslide_setting, debris_flow)
+}
+get.data('slide',  overwrite = F,
+         filter.slide.precip,
+         slide.all.precip,
+         precip.chirps.ww.event)
+slide
+```
+
+### Filter California Landslides
+```{r slide_california}
+filter.slide.ca <- function (slide.all.precip) {
+  slide.all.precip %>%
+    filter(is.in.ca.study(longitude, latitude)) %>%
+    mutate(region = as.factor(case_when(
+             latitude < 35.0 ~ 'South',
+             longitude < -121.25 ~ 'North',
+             TRUE ~ 'East')))
+}
+
+get.data('slide.ca',  overwrite = F,
+         filter.slide.ca, 
+         slide.all.precip)
+
+slide %>% summary
+```
+
+### Filter California CHIRPS data
+```{r chirps_precip_ca}
+filter.precip.ca <- function (precip.chirps.ww.event, slide.ca) {
+  precip.chirps.ca <- precip.chirps.ww.event%>%
+    dplyr::filter(OBJECTID %in% slide.ca$OBJECTID)
+}
+
+get.data('precip.chirps.ca.event', filter.precip.ca,  overwrite = F,
+         precip.chirps.ww.event, slide.ca)
+get.data('precip.chirps.ca.all', filter.precip.ca, overwrite = F,
+         precip.chirps.ww.all, slide.ca)
+
+precip.chirps.ca.event %>%
+  # Filter out sites with no precipitation data at all
+  filter(days_before==-1, window==7, !is.na(pctl)) %>%
+  # Filter out sites already excluded by landslide criteria
+  inner_join(slide.all.precip, by = 'OBJECTID') %>%
+  # Count numbers of zero and non-zero precipitation
+  group_by(precip = ifelse(pctl > 0, 'non.zero.precip', 'zero.precip')) %>%
+  tally() %>%
+  spread(key = precip, value = n) %>%
+  mutate(total = non.zero.precip + zero.precip,
+         percent.zero.precip = zero.precip / total * 100)
+```
+
+### Import Daymet data for California
+```{r dayment_precip.ca}
+load.precip.daymet.ca <- function (precip.daymet.ca.path) {
+  read_csv(precip.daymet.ca.path, 
+           col_types = cols(X1 = col_datetime(format = "%Y-%m-%d %H:%M:%S"))) %>% 
+  rename(date=X1) %>%
+  date.filter.precip %>%
+  tidy.precip
+}
+
+get.data('precip.daymet.ca.all', overwrite = F,
+         load.precip.daymet.ca, 
+         precip.daymet.ca.path)
+
+precip.daymet.ca.all
+```
+
+## Fire data computed from MODIS Burned Area
+
+```{r modis_find_fires}
+load.modis <- function (modis.paths, burn.date.min, burn.date.max) {
+  modis.date.raw <- dplyr::bind_rows(map(modis.paths, read_csv))
+  burn.record.length <- time_length(burn.date.max - burn.date.min, 'years')
+  modis.date.raw %>% 
+    dplyr::right_join(slide %>% dplyr::select(OBJECTID, event_date, latitude), 
+                      by='OBJECTID') %>%
+    # Convert MODIS Burned Area value to date
+    dplyr::mutate(burn_date = make_date(year=floor(month / 1000)) + burn_date) %>%
+    dplyr::select(-month) %>%
+    # Separate out indivicual fires
+    dplyr::group_by(OBJECTID) %>%
+    dplyr::mutate(gap = as.integer(burn_date - lag(burn_date, default=min(burn_date))),
+                  new.fire = gap > 30,
+                  fire.id = cumsum(new.fire)) %>%
+    drop_na(fire.id) %>%
+    # Calculate burn fraction, fire ending date, and season for each fire
+    dplyr::group_by(OBJECTID, event_date, fire.id) %>%
+    summarize(fraction = sum(fraction), 
+              burn_date = max(burn_date),
+              burn_season = yday.to.season(yday(burn_date), latitude)) %>%
+    # Calculate time relative to landslide
+    dplyr::mutate(burn_days_before = event_date - burn_date,
+                  burn_years_before = time_length(burn_days_before, 'years')) %>%
+    # Compute fire information
+    dplyr::group_by(OBJECTID) %>%
+    dplyr::mutate(pre.slide = burn_date==max(burn_date[burn_days_before>=0]),
+                  n = n(),
+                  period = burn.record.length / n,
+                  start_days_before = min(event_date) - burn.date.min,
+                  start_years_before = time_length(start_days_before, 'years'),
+                  end_days_before = max(event_date) - burn.date.max,
+                  end_years_before = time_length(end_days_before, 'years')) %>%
+    dplyr::select(-event_date) %>%
+    dplyr::ungroup()
+}
+
+get.data('modis.date', overwrite = F,
+         load.modis,
+         modis.paths, modis.start.date, modis.end.date)
+modis.date
+```
+
+```{r classify_burned}
+classify.burned <- function (modis.date, slide) {
+  modis.date  %>%
+    dplyr::filter(burn_years_before >=0 & burn_years_before < 3) %>%
+    dplyr::right_join(slide, by='OBJECTID') %>%
+    dplyr::group_by(OBJECTID) %>%
+    summarize(burn.cumulative = sum(fraction)) %>%
+    dplyr::mutate(burn.cumulative = ifelse(is.na(burn.cumulative), 
+                                           0, 
+                                           burn.cumulative),
+                  burned = ifelse(burn.cumulative > 0, 'burned', 'unburned')) %>%
+    dplyr::select(OBJECTID, burned, burn.cumulative) %>% 
+    dplyr::ungroup()
+}
+
+get.data('modis', overwrite = T,
+         classify.burned, 
+         modis.date,
+         slide)
+
+modis %>%
+  group_by(burned) %>%
+  tally() %>%
+  mutate(percent = n / nrow(slide) * 100)
+```
+
+
+## Define regions using AGNES clustering
+
+```{r cluster_regions, fig.width=16, fig.height=8, fig.show='hide'}
+cluster.global <- function (slide, agclusts, k=30) {
+  # Select clusters with more than 100 landslides, and label
+  slide %>%
+    dplyr::select(OBJECTID, latitude, longitude) %>%
+    dplyr::mutate(region = agclusts %>% cutree(k)) %>%
+    dplyr::group_by(region) %>%
+    mutate(region = as_factor(region)) %>%
+    dplyr::filter(n() > 100)  %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(region = fct_recode(as_factor(region),
+                              'Central Europe' = '1', 
+                              'Malaysia' = '2', 
+                              'Western US/Canada' = '3',
+                              'East Brazil' = '4',
+                              'Southeast Asia' = '5',
+                              'South India' = '6',
+                              'Eastern US' = '8',
+                              'Himalayas' = '9',
+                              'Southeast Asia' = '10',
+                              'Caribbean/Venezuela' = '11', 
+                              'Central America' = '14'))
+}
+
+# Cluster landslides based on location using AGNES algorithm
+get.data('agclusts', 
+         cluster::agnes, 
+         slide %>%
+           dplyr::select(latitude, longitude))
+
+
+get.data('clusters.global',  overwrite = F,
+         cluster.global, 
+         slide.all.precip, agclusts)
+
+clusters.global %>%
+    ggplot(aes(longitude, latitude)) +
+    theme_global_map +
+    geom_point(aes(color = region), size=1) +
+    scale_color_brewer('Region', palette='Paired') +
+    guides(color=guide_legend(override.aes = list(size=5)))
+```
+
+```{r split_us_regions, fig.show='hide'}
+split.regions.us <- function (agclusts, slide, k=6) {
+  # Crop cluster tree, select clusters with more than 100 landslides, and label
+  slide %>%
+    dplyr::select(OBJECTID, latitude, longitude) %>%
+    dplyr::mutate(region = agclusts %>% cutree(k)) %>%
+    mutate(region = as_factor(region)) %>%
+    dplyr::mutate(region = fct_recode(as_factor(region),
+                                      'Intermountain West' = '3',
+                                      'Intermountain West' = '4',
+                                      'Intermountain West' = '5',
+                                      'Pacific Northwest' = '1',
+                                      'California' = '2')) %>%
+    dplyr::group_by(region) %>%
+    dplyr::filter(n() > 100)  %>%
+    dplyr::ungroup() %>%
+    droplevels()
+}
+
+get.data('agclusts.us',  overwrite = F,
+         function (coord) cluster::agnes(coord, stand=T), 
+         clusters.global %>%
+           dplyr::filter(region=='Western US/Canada') %>%
+           dplyr::select(latitude, longitude))
+
+get.data('clusters.us',  overwrite = F,
+         split.regions.us,
+         agclusts.us, 
+         clusters.global %>%
+           dplyr::filter(region=='Western US/Canada'))
+
+clusters.us %>%
+  ggplot(aes(longitude, latitude)) +
+  geom_point(aes(color = region), size=1) +
+  scale_color_brewer(palette='Set2') +
+  guides(color=guide_legend(override.aes = list(size=5))) +
+  theme_map
+```
+
+```{r merge_regions}
+merge.regions <- function (clusters.global, clusters.us) {
+  # Merge US and global regions
+  clusters.global %>%
+    left_join(clusters.us %>% dplyr::select(OBJECTID, region), 
+              by='OBJECTID') %>%
+    dplyr::mutate(region = as_factor(ifelse(!is.na(region.y), 
+                                            as.character(region.y), 
+                                            as.character(region.x)))) %>%
+    dplyr::select(-starts_with('region.')) %>%
+    filter(region != 'Western US/Canada') %>%
+    droplevels()
+}
+
+get.data('regions.all', overwrite = F,
+         merge.regions, 
+         clusters.global, clusters.us)
+```
+
+```{r get_regions_info}
+get.regions.info <- function (regions.all, slide) {
+  regions.all %>%
+    bind_rows(slide %>% dplyr::mutate(region = 'All landslides')) %>%
+    dplyr::inner_join(modis, by = 'OBJECTID') %>%
+    group_by(region) %>%
+    dplyr::group_by(region, burned) %>%
+    dplyr::summarize(n = n()) %>%
+    tidyr::spread(key = burned, value = n) %>%
+    dplyr::mutate(n = burned + unburned,
+                  percent.burned = burned / n * 100) %>%
+    ungroup
+}
+
+get.data('regions.info', overwrite = F,
+         get.regions.info,
+         regions.all, slide)
+
+regions.info
+```
+
+
+
+```{r filter_and_merge_regions}
+filter.and.merge.regions <- function (regions.all, regions.info, slide) {
+  # Combine nearby regions
+  regions.all  %>%
+    filter(OBJECTID %in% slide$OBJECTID) %>%
+    bind_rows(slide %>% dplyr::mutate(region = 'All landslides')) %>% 
+    dplyr::left_join(regions.info) %>% 
+    mutate(region = fct_recode(region,
+                               'Central America' = 'Caribbean/Venezuela')) %>%
+    dplyr::filter(region != 'East Brazil', 
+                  percent.burned > 4) %>%
+    droplevels() %>%
+    dplyr::mutate(region = factor(region, region.plot.order, ordered = T)) %>%
+    dplyr::select(OBJECTID, region)
+}
+
+get.data('slide.regions',  overwrite = F,
+         filter.and.merge.regions, 
+         regions.all, 
+         regions.info, 
+         slide)
+regions.all %>% unique
+
+regions.tally <- slide.regions %>%
+  group_by(region) %>%
+  tally
+
+regions.tally
+```
+```{r}
+slide %>% 
+  left_join(modis, by='OBJECTID') %>%
+  group_by(burned, landslide_category) %>%
+  tally() %>%
+  group_by(burned) %>%
+  mutate(percentage = n / sum(n))
+```
+```{r}
+slide %>%
+  group_by(landslide_category) %>%
+  tally() %>%
+  mutate(percentage = n / sum(n))
+```
+
+# Exploration
+## Map
+### Regions map
+```{r map_regions, fig.height=3, fig.width=6.5, fig.show='hide'}
+gg.region <- slide.regions %>%
+  left_join(slide, by='OBJECTID') %>%
+  mutate(region = fct_relevel(region, 'All landslides', after = Inf)) %>%
+  arrange(desc(region)) %>%
+  ggplot(aes(longitude, latitude)) +
+  theme_global_map +
+  geom_point(aes(color = region), size=0.02) + 
+  labs(color = '') +
+  scale_color_region +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  theme_panel_legend
+
+gg.region
+```
+
+### Fire map
+```{r map_fire, fig.height=3, fig.width=6.5, fig.show='hide'}
+gg.burned <- slide %>%
+  dplyr::left_join(modis) %>%
+  dplyr::arrange(desc(burned)) %>%
+  ggplot() +
+  theme_global_map +
+  #geom_point(data = slide.regions %>%
+  #             dplyr::filter(region !='All landslides') %>%
+  #             dplyr::left_join(slide, by='OBJECTID'),
+  #           aes(x = longitude, y = latitude, fill = region),
+  #           size = 2, alpha = .01, shape = 21, stroke = NA) +
+  geom_point(aes(x=longitude, y=latitude, color=burned),
+             size=.02) +
+  scale_color_burned +
+  #scale_fill_region +
+  guides(color = guide_legend(override.aes = list(size = 2),
+                              title = NULL),
+         fill = guide_none()) +
+  theme_panel_legend
+
+gg.burned
+```
+
+### Precipitation map
+```{r map_precipitation, fig.height=3.5, fig.width=6.5, fig.show='hide'}
+gg.precip <- slide %>%
+  left_join(precip.chirps.ww.event %>% 
+              filter(days_before==-1, window==7), 
+            by='OBJECTID') %>%
+  filter(pctl > 0) %>%
+  arrange(desc(pctl)) %>%
+  ggplot() +
+  theme_global_map +
+  geom_point(aes(x=longitude, y=latitude, color=pctl),
+             size=.02) +
+  scale_color_precip +
+  theme_panel_legend
+
+gg.precip
+```
+
+### Burned fraction
+
+```{r fig.width=7, fig.height=1.05, fig.show='hide'}
+min.burn.cumulative <- modis %>%
+  filter(burn.cumulative > 0) %>%
+  pull(burn.cumulative) %>%
+  min
+max.burn.cumulative <- modis %>%
+  pull(burn.cumulative) %>%
+  max
+plot.burned.fraction <- function (reg, slide.regions, modis) {
+  slide.regions %>%
+    filter(region==reg) %>%
+    left_join(modis, by = 'OBJECTID') %>%
+    filter(burn.cumulative > 0) %>%
+    ggplot() +
+    geom_density(aes(x = burn.cumulative), fill = 'black') +
+    scale_x_log10() +
+    labs(x = 'Burned fraction', y = '') +
+    scale_color_region +
+    scale_fill_region +
+    coord_cartesian(expand=F, xlim = c(min.burn.cumulative, max.burn.cumulative)) +
+    theme_bw() +
+    theme(legend.position = 'none',
+          axis.text.x = element_text(angle = 90, vjust = 0.5, size = 4),
+          axis.title = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.background = element_blank(),
+          panel.grid = element_blank(),
+          plot.title = element_text(size = 5, margin=margin(0,0,0,0))) +
+    ggtitle(str_c(reg, '\nn=', pull(filter(regions.tally, region==reg))))
+}
+
+gg.burned.fraction <- region.plot.order %>%
+  set_names %>%
+  map(plot.burned.fraction, slide.regions, modis)
+
+cowplot::plot_grid(plotlist = gg.burned.fraction, nrow = 1)
+```
+
+### Location accuracy by region/fire history
+```{r accuracy_by_region, fig.width=7, fig.height=1.05, fig.show='hide'}
+plot.accuracy <- function (reg, slide.regions, slide, modis) {
+  slide.regions %>%
+    left_join(slide, by='OBJECTID') %>%
+    left_join(modis, by='OBJECTID') %>%
+    filter(region==reg) %>%
+    mutate(location_accuracy = fct_recode(location_accuracy, '0km' = 'exact')) %>%
+    drop_na(location_accuracy) %>%
+    ggplot() +
+    geom_bar(aes(x = location_accuracy, fill=burned,
+                 group = interaction(region, burned),
+                 y = ..prop..), 
+             position=position_dodge2(preserve = 'single')) +
+    scale_fill_burned +
+    coord_cartesian(expand=F, ylim = c(0, 0.6)) +
+    theme_bw() +
+    labs(y = '', x = '', fill = 'Location\naccuracy') +
+    theme(legend.position = 'none',
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, 
+                                     size = 4),
+          axis.title = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.background = element_blank(),
+          panel.grid = element_blank(),
+          plot.title = element_text(size = 5, margin=margin(0,0,0,0))) +
+    ggtitle(str_c(reg, '\nn=', pull(filter(regions.tally, region==reg))))
+}
+
+gg.accuracy <- region.plot.order %>%
+  set_names %>%
+  map(plot.accuracy, slide.regions, slide, modis)
+
+cowplot::plot_grid(plotlist = gg.accuracy, nrow = 1)
+```
+
+### Climatology by region
+```{r climatology_by_region, fig.width=7, fig.height=1.05, fig.show='hide'}
+plot.climatology <- function (reg, precip.monthly, slide.regions, med) {
+  precip.seasonal <- precip.monthly %>%
+    group_by(OBJECTID, year, season) %>%
+    summarize(precip.mm = sum(precip.mm)) 
+  
+  ymin <- 1
+  ymax <- max(precip.seasonal$precip.mm, na.rm=T)
+  
+  precip.seasonal %>%
+    dplyr::right_join(slide.regions %>% filter(region==reg)) %>%
+    drop_na(season) %>%
+    ggplot()  +
+    geom_violin(aes(y = precip.mm, x = season, group = season),
+                fill='black', color=NA, adjust = 2)  +
+    geom_hline(aes(yintercept = med), color = 'grey', size = .3)+
+    scale_y_log10(breaks = c(1, 10, 100, 1000)) +
+    scale_x_discrete(labels = c('Spring' = 'MAM', 'Summer' = 'JJA',
+                                'Fall' = 'SON', 'Winter' = 'DJF'),
+                     expand = ggplot2::expand_scale(add = c(1, 0))) +
+    coord_cartesian(expand=F, ylim = c(ymin, ymax)) +
+    theme_bw() +
+    theme(legend.position = 'none',
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 4, 
+                                     margin=margin(0,0,0,0)),
+          axis.text.y = element_text(size = 4, hjust = 1, vjust = 0.5),
+          axis.title = element_blank(),
+          plot.background = element_blank(),
+          panel.grid = element_blank(),
+          plot.title = element_text(size = 5, margin=margin(0,0,0,0))) +
+    ggtitle(str_c(reg, '\nn=', pull(filter(regions.tally, region==reg))))
+}
+
+gg.climatology <- region.plot.order %>%
+  purrr::set_names() %>%
+  purrr::map(plot.climatology, 
+             precip.chirps.ww.monthly, 
+             slide.regions, 
+             precip.chirps.ww.seasonal.median)
+ 
+cowplot::plot_grid(plotlist = gg.climatology, nrow = 1)
+```
+
+### Panelled map
+
+```{r map_combined}
+coord_america <- coord_equal(xlim = c(-140, -50), ylim = c(-8, 53), expand = F)
+coord_asia <-  coord_equal(xlim = c(50, 140), ylim = c(-12, 49), expand = F) 
+
+# Clip maps
+gg.america.region <- gg.region + theme_panel + coord_america
+gg.asia.region <- gg.region + theme_panel + coord_asia
+gg.america.burned <- gg.burned + theme_panel + coord_america
+gg.asia.burned <- gg.burned + theme_panel + coord_asia
+gg.america.precip <- gg.precip + theme_panel + coord_america
+gg.asia.precip <- gg.precip + theme_panel + coord_asia
+
+# Pull legends
+legend.regions <- cowplot::get_legend(gg.region)
+legend.burned <- cowplot::get_legend(gg.burned)
+legend.precip <- cowplot::get_legend(gg.precip)
+
+# Region midpoints for arrows
+region.centroids <- slide.regions %>%
+  left_join(slide) %>%
+  group_by(region) %>%
+  summarize(y = mean(latitude), x = mean(longitude))
+```
+
+```{r insets_regions, fig.height=1.05, fig.width = 1.75, fig.show='hide'}
+
+# Add insets
+inset.w <- .2
+inset.h <- .41
+inset.arrow <- grid::arrow(length = unit(0.03, "npc"), type = 'open')
+# Regions
+gg.america.region.inset <- cowplot::ggdraw(gg.america.region) +
+  # Arrows
+  cowplot::draw_grob(grid::grid.lines(x = c(.1, .25), y = c(.8, .8), 
+                                      arrow=inset.arrow)) +
+  cowplot::draw_grob(grid::grid.lines(x = c(.1, .275), y = c(.4, .65), 
+                                      arrow=inset.arrow)) +
+  cowplot::draw_grob(grid::grid.lines(x = c(.4, .4), y = c(.375, .575), 
+                                      arrow=inset.arrow)) +
+  cowplot::draw_grob(grid::grid.lines(x = c(.825, .675), y = c(.675, .3), 
+                                      arrow=inset.arrow)) +
+  # Inset plots
+  cowplot::draw_plot(gg.accuracy$`Pacific Northwest`, 
+                     x = 0.01, y = 1, 
+                     width = inset.w, height = inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.accuracy$California, 
+                     x = 0.01, y = .6, 
+                     width = inset.w, height = inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.accuracy$`Intermountain West`, 
+                     x = .275, y = .4, 
+                     width = inset.w, height = inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.accuracy$`Central America`,  
+                     x = .775, y = .8, 
+                     width = inset.w, height = inset.h, vjust = 1)
+
+gg.asia.region.inset <- cowplot::ggdraw(gg.asia.region) +
+  #Arrows
+  cowplot::draw_grob(grid::grid.lines(x = c(.3, .4), y = c(.3, .6), 
+                                      arrow=inset.arrow)) +
+  cowplot::draw_grob(grid::grid.lines(x = c(.825, .8), y = c(.55, .4), 
+                                      arrow=inset.arrow)) +
+  # Inset plots
+  cowplot::draw_plot(gg.accuracy$Himalayas,
+                     x = .15, y = 0.4, 
+                     width = inset.w, height= inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.accuracy$`Southeast Asia`,
+                     x = .775, y = .935, 
+                     width = inset.w, height = inset.h, vjust = 1)
+
+# Fire
+gg.america.burned.inset <- cowplot::ggdraw(gg.america.burned) +
+  cowplot::draw_plot(gg.burned.fraction$`Pacific Northwest`, 
+                     x = 0, y = 1, 
+                     width = inset.w, height = inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.burned.fraction$California, 
+                     x = 0, y = .6, 
+                     width = inset.w, height = inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.burned.fraction$`Intermountain West`, 
+                     x = .275, y = .4, 
+                     width = inset.w, height = inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.burned.fraction$`Central America`, 
+                     x = .775, y = .8, 
+                     width = inset.w, height = inset.h, vjust = 1)
+
+gg.asia.burned.inset <- cowplot::ggdraw(gg.asia.burned) +
+  cowplot::draw_plot(gg.burned.fraction$Himalayas,
+                     x = .15, y = 0.4,
+                     width = inset.w, height= inset.h, vjust = 1) +
+  cowplot::draw_plot(gg.burned.fraction$`Southeast Asia`,
+                     x = .775, y = .935, 
+                     width = inset.w, height = inset.h, vjust = 1)
+
+# Precipitation
+inset.w.p = .23
+inset.h.p = .41
+gg.america.precip.inset <- cowplot::ggdraw(gg.america.precip) +
+  cowplot::draw_plot(gg.climatology$`Pacific Northwest`, 
+                     x = 0, y = 1.01, 
+                     width = inset.w.p, height = inset.h.p, vjust = 1) +
+  cowplot::draw_plot(gg.climatology$California, 
+                     x = .085, y = .64, 
+                     width = inset.w.p, height = inset.h.p, vjust = 1) +
+  cowplot::draw_plot(gg.climatology$`Intermountain West`, 
+                     x = .245, y = .395, 
+                     width = inset.w.p, height = inset.h.p, vjust = 1) +
+  cowplot::draw_plot(gg.climatology$`Central America`, 
+                     x = .71, y = .8, 
+                     width = inset.w.p, height = inset.h.p, vjust = 1)
+
+gg.asia.precip.inset <- cowplot::ggdraw(gg.asia.precip) +
+  cowplot::draw_plot(gg.climatology$Himalayas,
+                     x = .15, y = 0.4,  
+                     width = inset.w.p, height= inset.h.p, vjust = 1) +
+  cowplot::draw_plot(gg.climatology$`Southeast Asia`,
+                      x = .7, y = .935, 
+                     width = inset.w.p, height = inset.h.p, vjust = 1)
+```
+
+```{r map_panel, fig.height=8, fig.width=7}
+panel.labels <- tibble(
+  label = as_factor(c('Location accuracy distribution\nfor burned and unburned sites by region',
+                      'Locations of burned sites and\nregional distribution of burned fraction',
+                      str_c('Landslide-triggering precipitation percentile\nand',
+                            'regional seasonal precipitation (mm)')))
+)
+gg.panel.labels <- ggplot(panel.labels) +
+  facet_wrap(~label, ncol = 1, switch = T) +
+  theme(panel.background = element_blank(),
+        strip.text = element_text(face="bold", size=7))
+
+gg.panel.maps <- cowplot::plot_grid(
+  cowplot::plot_grid(gg.america.region.inset, gg.asia.region.inset,
+                   labels = c('a', 'b'), label_x = 1, hjust = 1, vjust = 1),
+  legend.regions,
+  cowplot::plot_grid(gg.america.burned.inset, gg.asia.burned.inset,
+                     labels = c('c', 'd'), label_x = 1, hjust = 1, vjust = 1),
+  legend.burned,
+  cowplot::plot_grid(gg.america.precip.inset, gg.asia.precip.inset,
+                     labels = c('e', 'f'), label_x = 1, hjust = 1, vjust = 1),
+  legend.precip,
+  ncol = 1, rel_heights = c(1, .3, 1, .2, 1, .3))
+gg.panel <- cowplot::plot_grid(gg.panel.labels, gg.panel.maps, 
+                               nrow = 1, rel_widths = c(.5, 6.5))
+gg.panel
+
+ggsave(filename = file.path(figure.dir, "panel_map.png"), width=7, height=8)
+```
+
+
+## Location accuracy
+
+```{r calc_burned_pct}
+
+calc.burned.pct <- function (slide.regions, modis, slide) {
+  slide.regions %>%
+    left_join(modis, by='OBJECTID') %>%
+    left_join(slide %>% select(OBJECTID, location_accuracy), 
+              by = 'OBJECTID') %>%
+    group_by(region, burned, location_accuracy) %>%
+    summarise(n=n()) %>%
+    pivot_wider(id_cols = c(region, location_accuracy), 
+                names_from = 'burned', 
+                values_from = 'n') %>%
+    mutate(total = burned + unburned,
+           burned.pct = burned / total * 100)
+}
+
+get.data('burned.pct', overwrite = F,
+         calc.burned.pct,
+         slide.regions, modis, slide)
+
+burned.pct
+```
+
+```{r plot_burned_pct, fig.width=5, fig.height = 1}
+burned.pct %>%
+  ggplot() +
+  facet_wrap('region', nrow = 1) +
+  geom_col(aes(x = location_accuracy, y = burned.pct, fill = region), 
+           position = 'dodge') +
+  scale_fill_region +
+  labs(x = 'Location accuracy', y = 'Percent burned sites') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = 'none')
+```
+
+## Fire timing
+
+```{r fire_timing}
+calc.fire.timing <- function (modis.date, modis, slide) {
+  modis.date %>%
+    dplyr::filter(burn_years_before >= 0 & burn_years_before < 3) %>%
+    dplyr::group_by(OBJECTID) %>%
+    dplyr::filter(burn_days_before == min(burn_days_before))  %>%
+    right_join(modis %>% dplyr::filter(burned=='burned'), by='OBJECTID') %>%
+    inner_join(slide.regions, by='OBJECTID') %>%
+    left_join(slide %>% dplyr::select(OBJECTID, event_yday, season), by='OBJECTID') %>% 
+    dplyr::mutate(burn_yday = yday(burn_date),
+                  burn_season = factor(burn_season,
+                                       levels = c('Spring', 'Summer', 'Fall', 'Winter'),
+                                       ordered = T))
+}
+
+get.data('fire.timing', overwrite = T,
+         calc.fire.timing, 
+         modis.date, modis, slide)
+```
+
+```{r calc_fire_timing_proportions}
+fire.timing %>%
+  dplyr::mutate(gt.1year = ifelse(burn_days_before > 365, 
+                                  'gt.1year', 'lt.1year')) %>%
+  dplyr::group_by(region, gt.1year) %>%
+  dplyr::tally() %>%
+  tidyr::spread(gt.1year, n, drop=F) %>%
+  dplyr::mutate(prop.gt.1year = gt.1year / (gt.1year + lt.1year),
+                prop.lt.1year = 1 - prop.gt.1year)
+  
+```
+
+```{r plot_fire_landslide_timing, fig.height = 8, fig.width = 6.5}
+fire.to.landslide.x.breaks <- seq(season.breaks[4] - 4 * 365, season.breaks[3], 
+                                  365/4)
+fire.to.landslide.x.labels <- map(c(str_c('-', c(3, 2, 1), 'y '), ''), 
+                                  ~c(str_c(., 'Winter'), 
+                                     'Spring', 'Summer', 'Fall')) %>% as_vector
+
+fire.facet.labels <- fire.timing %>%
+  dplyr::group_by(region) %>%
+  dplyr::mutate(wrap_event_yday = ifelse(event_yday > season.breaks['winter'], 
+                                         event_yday - 365, event_yday)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(ymin = min(wrap_event_yday - burn_days_before),
+                ymax = max(wrap_event_yday)) %>%
+  dplyr::group_by(region) %>%
+  dplyr::summarize(y = n() * 0.8, x = min(ymin) + (max(ymax) - min(ymin)) * 0.1) %>%
+  dplyr::mutate(label = c('a', 'b', 'c', 'd', 'e', 'f', 'g'))
+
+fire.timing %>%
+  dplyr::group_by(region) %>%
+  dplyr::mutate(wrap_event_yday = ifelse(event_yday > season.breaks['winter'], 
+                                         event_yday - 365, event_yday)) %>%
+  dplyr::arrange(wrap_event_yday - burn_days_before) %>%
+  dplyr::mutate(i = row_number()) %>%
+  ggplot() +
+  facet_wrap(vars(region), scales = 'free_y', ncol = 2, shrink=F) +
+  geom_segment(aes(x = wrap_event_yday - burn_days_before, xend = wrap_event_yday,
+                   y = i, yend = i, 
+                   color = burn_season)) +
+  geom_point(aes(x = wrap_event_yday, y = i, shape='Landslide'), size=0.5) +
+  geom_vline(data = tibble(x=seq(334-365*3, 365, 365)), 
+             aes(xintercept = x, size = 'start_of_winter')) +
+  geom_vline(aes(xintercept = 334 - 365, size = 'year_of')) +
+  geom_rug(aes(y = i, color = burn_season)) +
+  geom_rug(aes(x = event_yday - burn_days_before), sides = 't', length = unit(0.05, "npc")) +
+  geom_label(data = fire.facet.labels,
+             aes(x = x, y = y, label = label)) +
+  theme_bw() +
+  scale_x_continuous('Landslides and preceding fires relative to the year of the landslide',
+                     minor_breaks = NULL,
+                     breaks = as_vector(fire.to.landslide.x.breaks),
+                     labels = fire.to.landslide.x.labels) +
+  scale_color_manual('Fire season:',
+                     values = c('Spring'='#19E667', 'Summer'='#E61998', 
+                                'Fall'='#E6CD19', 'Winter'='#1932E6'),
+                     guide = guide_legend(nrow=1, order = 2)) + 
+  scale_y_continuous('Post-wildfire landslides ordered by fire timing relative to landslide', 
+                     expand = c(0.1, 0.1)) +
+  scale_size_manual('Relative timing:',
+                    values = c('year_of' = 1, 'start_of_winter' = 0.5),
+                    labels = c('year_of' = 'Start of year of landslide',
+                               'start_of_winter' = 'Start of winter (December 1)'),
+                    guide = guide_legend(nrow=2, order = 3)) +
+  guides(shape = guide_legend(title = NULL, override.aes = c(size = 1.5), order = 1)) +
+  theme(panel.grid.major.x = element_line(color = 'grey', size = 0.5),
+        axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90),
+        axis.ticks = element_blank(),
+        axis.text.y = element_blank(),
+        legend.position = c(.75, .04),
+        legend.direction = 'vertical',
+        legend.box = 'vertical',
+        legend.margin = unit(5, 'pt'),
+        legend.box.margin = margin(5, 5, 5, 5),
+        legend.box.background = element_rect(color = 'black', size = 2),
+        legend.key.height = unit(10, 'pt') 
+  )
+ggsave(file.path(figure.dir, 'fire_to_landslide.png'), width = 6.5, height = 8)
+```
+
+
+# Analysis 
+
+## CHIRPS vs Daymet
+
+```{r join_chirps_daymet}
+join.chirps.daymet <- function (precip.chirps, precip.daymet) {
+  precip.chirps %>%
+    dplyr::inner_join(precip.daymet %>% dplyr::select(-days_before, -yday), 
+                      by=c('OBJECTID', 'date', 'window'), 
+                      suffix=c('.chirps', '.daymet'))
+}
+
+get.data('precip.chirps.daymet.ca.event', join.chirps.daymet, overwrite = F,
+         precip.chirps.ca.event, 
+         precip.daymet.ca.all)
+get.data('precip.chirps.daymet.ca.all', join.chirps.daymet, overwrite = F,
+         precip.chirps.ca.all, precip.daymet.ca.all)
+precip.chirps.ca.event %>%
+  filter(days_before==-1, window==7, !is.na(pctl)) %>%
+  group_by(precip = ifelse(pctl > 0, 'non.zero.precip', 'zero.precip')) %>%
+  tally() %>%
+  spread(key = precip, value = n) %>%
+  mutate(total = non.zero.precip + zero.precip,
+         percent.zero.precip = zero.precip / total)
+```
+
+
+```{r plot_chirps_daymet, fig.height=4, fig.width=6}
+precip.chirps.daymet.ca.all %>%
+  tidyr::drop_na(pctl.chirps, pctl.daymet) %>%
+  ggplot() +
+  geom_point(aes(x=pctl.chirps, y=pctl.daymet, color = 'all'), 
+             alpha=0.2,shape = 16) +
+  geom_point(data = precip.chirps.daymet.ca.event %>% 
+               dplyr::filter(window == 7, days_before == -1 ) %>%
+               dplyr::mutate(to.remove = ifelse(pctl.chirps==0, 'exclude', 'keep')),
+             aes(x=pctl.chirps, y=pctl.daymet, color=to.remove)) +
+  coord_equal() +
+  theme_bw() +
+  scale_color_manual('', 
+                     values = c('keep'='black', 'exclude'='blue', 'all'='gray'),
+                     labels = c('keep'='Included\nday-of-landslide\npreciptiation',
+                                'exclude'='Excluded\nday-of-landlside\nprecipitation',
+                                'all'='Precipitation\nfrom all dates')) +
+  guides(color = guide_legend(keyheight = grid::unit(4, 'char'))) +
+  labs(x='CHIRPS 7-day Precipitation Percentile',
+       y='Daymet 7-day Precipitation Percentile')
+
+ggsave(file.path(figure.dir, 'chirps_vs_daymet.png'), width=6, height=4, dpi=600)
+```
+
+
+## Precipitation percentile wilcox test
+```{r wilcox_functions}
+calc.burn.wilcox <- function (precip, pre=30, post=10, alternative='two.sided', 
+                              source=NA, groupby=c('burned', 'days_before')) {
+  precip %>%
+    dplyr::filter(days_before <= pre, days_before >= -post) %>%
+    dplyr::group_by_at(groupby) %>%
+    calc.wilcox(alternative, source)
+}
+  
+calc.wilcox <- function (precip, alternative='two.sided', source=NA) {
+  wilcox <- precip %>%
+    tidyr::nest() %>%
+    spread(key = 'burned', value = 'data') %>%
+    dplyr::mutate(wilcox = map2(burned, unburned, 
+                                possibly(~wilcox.test(.x$pctl, .y$pctl, 
+                                                      alternative=alternative),
+                                         otherwise = NA)
+                                ),
+                  ) %>%
+    dplyr::filter(!is.na(wilcox)) %>%
+    dplyr::mutate(wilcox.glance = map(wilcox, glance)) %>%
+    tidyr::unnest(wilcox.glance) %>%
+    dplyr::mutate(signif.95 = p.value <= 0.05) %>%
+    gather(key = 'burned', value = 'data', burned, unburned) %>%
+    tidyr::unnest(data)
+  if (!is.na(source)) wilcox <- wilcox %>% dplyr::mutate(label=source)
+  wilcox
+}
+
+magnitude.regional.data <- function (slide.regions, precip, 
+                                     pre = 30, post = 10, w = 7,
+                                     groupby = c('region', 'burned', 'days_before')) {
+  precip %>%
+    dplyr::filter(days_before < pre, days_before > -post, window==w) %>%
+    right_join(slide.regions, by = 'OBJECTID') %>%
+    dplyr::left_join(modis, by = 'OBJECTID') %>%
+    dplyr::filter(pctl > 0) %>%
+    droplevels() %>%
+    calc.burn.wilcox(pre = pre, post = post, alternative = 'less',
+                     groupby = groupby)
+}
+
+get.data('burn.wilcox.regions.event', overwrite = F,
+         magnitude.regional.data,
+         slide.regions,
+         precip.chirps.ww.event)
+```
+
+```{r plot_burn_wilcox, fig.height=11, fig.width=11}
+facet.levels <- c('Rolling cumulative\nprecipitation percentile',
+                  'Mann-Whitney p-value')
+
+plot.burn.wilcox <- function (burn.wilcox.regions.event, slide.regions) {
+  region.tally <- slide.regions %>% 
+    left_join(modis) %>% 
+    dplyr::group_by(burned=burn.cumulative > 0, region) %>% 
+    tally
+  
+  burn.wilcox.regions.event %>%
+    dplyr::mutate(signif.95 = ifelse(signif.95, 'significant', 'not.significant')) %>%
+    ggplot() +
+    facet_wrap(region~., ncol=1, strip.position = 'right') +
+    geom_boxplot(aes(x = days_before, 
+                     group=interaction(days_before, burned), 
+                     y = pctl, 
+                     fill = burned,
+                     alpha = interaction(signif.95, burned)), 
+                 outlier.shape=21)  +
+    annotate("rect", xmin = -0.5, xmax = 0.5, ymin = 0, ymax = 1, alpha = .4) +
+    geom_label(data=region.tally, 
+               aes(x=-15, y=0.1+0.25*burned, 
+                   label=str_c(ifelse(burned, 'Burned: ', 'Unburned: '), n)),
+               hjust='right', label.size = 0) +
+    geom_label(data = tibble(region = region.plot.order,
+                             label = c('a', 'b', 'c', 'd', 'e', 'f', 'g')) %>%
+                 dplyr::mutate(region = factor(region, region.plot.order, ordered = T)),
+               aes(x = -15, y = 0.85, label = label), hjust = 'right') +
+    scale_x_reverse(limits = c(31, -16), expand = expansion()) +
+    scale_fill_manual('', 
+                      values = c('burned' = '#d95f02', unburned = '#7570b3'),
+                      labels = c('burned'='Burned', 'unburned'='Unburned'),
+                      guide = guide_legend(direction = 'horizontal')) +
+    scale_alpha_manual('Statistical significance at\n95% confidence',
+                       values=c('not.significant.burned' = 0.4, 
+                                'not.significant.unburned' = 0.4,
+                                'significant.burned' = 1, 
+                                'significant.unburned' = 1),
+                       labels=c('not.significant.burned' = '', 
+                                'not.significant.unburned' = 'Not Significant',
+                                'significant.burned' = '', 
+                                'significant.unburned' = 'Significant'),
+                       breaks=c('not.significant.burned', 
+                                'not.significant.unburned',
+                                'significant.burned', 
+                                'significant.unburned'),
+                       guide=guide_legend(override.aes=list(fill=c('not.significant.burned' = '#d95f02', 
+                                                                   'not.significant.unburned' = '#7570b3',
+                                                                   'significant.burned' = '#d95f02', 
+                                                                   'significant.unburned' = '#7570b3')),
+                                          direction = 'horizontal')) +
+    theme_bw() +
+    labs(x='Days before the event', y='Rolling cumulative precipitation percentile') +
+    theme(legend.position = 'bottom', legend.direction = 'vertical')
+}
+
+burn.wilcox.regions.event %>%
+  plot.burn.wilcox(slide.regions)
+
+ggsave(file.path(figure.dir, 'magnitude_regional.png'), width = 11, height = 11)
+```
+
+```{r calc_wilcox_location_accuracy}
+calc.signif.days <- function (slide.regions, precip) {
+  slide.regions %>%
+  left_join(slide %>% select(OBJECTID, location_accuracy), by='OBJECTID') %>%
+  mutate(location_accuracy = ifelse(location_accuracy <= '1km', 
+                                    'high location accuracy', 
+                                    'low location accuracy')) %>%
+  magnitude.regional.data(precip,
+                          groupby = c('region', 'burned', 'days_before', 'location_accuracy')) %>%
+  group_by(region, days_before, location_accuracy) %>%
+  summarize(signif.95 = unique(signif.95),
+            p.value = unique(p.value),
+            total = n())
+}
+
+get.data('burn.wilcox.signif.days', overwrite = T,
+         calc.signif.days,
+         slide.regions,
+         precip.chirps.ww.event)
+
+slide.regions %>%
+  left_join(slide %>% select(OBJECTID, location_accuracy), by='OBJECTID') %>%
+  left_join(modis, by='OBJECTID') %>%
+  mutate(location_accuracy = ifelse(location_accuracy <= '1km', 
+                                    'high location accuracy', 'low location accuracy')) %>%
+  group_by(region, location_accuracy, burned) %>%
+  summarize(n = n()) %>%
+  pivot_wider(id_cols = c(region, location_accuracy), names_from = burned, values_from = n) %>%
+  mutate(burned.pct = burned / (burned + unburned) * 100)
+
+burn.wilcox.signif.days %>%
+  filter(days_before <14) %>%
+  group_by(region, location_accuracy) %>%
+  summarize(signif.95.days = sum(signif.95))
+```
+```{r plot_signif_location_accuracy, fig.width = 5, fig.height = 9.5}
+bootstrap.y.breaks <- c(10^-30,  10^-10,  0.05,   0.5,   0.9999)
+bootstrap.y.labels <- c('1e-30', '1e-10', '0.05', '0.5', '1')
+burn.wilcox.signif.days %>%
+  filter(days_before <14)%>%
+  ggplot() +
+  facet_wrap(facets = 'region', ncol = 1, strip.position = 'right') +
+  geom_line(aes(x = days_before, y = p.value, group = location_accuracy, 
+                color = location_accuracy),
+            size = 1) +
+  geom_line(data = burn.wilcox.regions.event %>%
+  filter(days_before <14)%>%
+              group_by(region, days_before) %>%
+              summarize(p.value = unique(p.value)),
+            aes(x = days_before, y = p.value, linetype = 'all location accuracy'),
+            size = 1) +
+  geom_hline(aes(yintercept = 0.05, linetype = '95% confidence')) +
+  geom_vline(aes(xintercept = 0))+
+  geom_label(data = tibble(region = region.plot.order,
+                           label = c('a', 'b', 'c', 'd', 'e', 'f', 'g')) %>%
+               dplyr::mutate(region = factor(region, region.plot.order, ordered = T)),
+             aes(x = -11.5, y = 0.9, label = label), 
+             hjust = 'right', vjust = 'bottom')   +
+  scale_x_reverse()  +
+  scale_y_continuous(trans = probit_trans(),
+                     breaks = bootstrap.y.breaks,
+                     labels = bootstrap.y.labels)  +
+  scale_color_brewer(palette = 'Dark2', guide = guide_legend(keywidth = 2)) +
+  scale_linetype_manual(values = c('95% confidence' = 'dashed', 
+                                   'all location accuracy' = 'solid'),
+                        guide = guide_legend(override.aes = list(size=1),
+                                             keywidth = 2)) +
+  labs(linetype = '', y = 'p-value', x = 'Days before landslide', color = '') +
+  theme_bw() +
+  theme(legend.position = 'bottom', legend.direction = 'vertical')
+ggsave(file.path(figure.dir, 'pvalues_location_accuracy.png'), width = 5, height = 9.5)
+```
+
+```{r debrisflow, fig.width = 5, fig.height = 9.5}
+calc.signif.debrisflow <- function (slide.regions, precip) {
+  slide.regions %>%
+  left_join(slide %>% select(OBJECTID, debris_flow), by='OBJECTID') %>%
+  mutate(debris_flow = ifelse(debris_flow, 'Debris flow', 'Other')) %>%
+  magnitude.regional.data(precip,
+                          groupby = c('region', 'burned', 'days_before', 'debris_flow')) %>%
+  group_by(region, days_before, debris_flow) %>%
+  summarize(signif.95 = unique(signif.95),
+            p.value = unique(p.value),
+            total = n())
+}
+
+get.data('burn.wilcox.signif.debrisflow', overwrite = T,
+         calc.signif.debrisflow,
+         slide.regions,
+         precip.chirps.ww.event)
+
+burn.wilcox.signif.debrisflow %>%
+  filter(days_before < 14) %>%
+  group_by(region, debris_flow) %>%
+  summarize(signif.95.days = sum(signif.95))
+
+bootstrap.y.breaks <- c(10^-30,  10^-10,  0.05,   0.5,   0.9999)
+bootstrap.y.labels <- c('1e-30', '1e-10', '0.05', '0.5', '1')
+burn.wilcox.signif.debrisflow %>%
+  filter(days_before <14) %>%
+  ggplot() +
+  facet_wrap(facets = 'region', ncol = 1, strip.position = 'right') +
+  geom_line(aes(x = days_before, y = p.value, group = debris_flow, 
+                color = debris_flow),
+            size = 1) +
+  geom_line(data = burn.wilcox.regions.event%>%
+              filter(days_before < 14) %>%
+              group_by(region, days_before) %>%
+              summarize(p.value = unique(p.value)),
+            aes(x = days_before, y = p.value, 
+                linetype = 'all mass movement types'),
+            size = 1) +
+  geom_hline(aes(yintercept = 0.05, linetype = '95% confidence')) +
+  geom_vline(aes(xintercept = 0)) +
+  geom_label(data = tibble(region = region.plot.order,
+                           label = c('a', 'b', 'c', 'd', 'e', 'f', 'g')) %>%
+               dplyr::mutate(region = factor(region, region.plot.order, ordered = T)),
+             aes(x = -11.5, y = 0.9, label = label), 
+             hjust = 'right', vjust = 'bottom')   +
+  scale_x_reverse()  +
+  scale_y_continuous(trans = probit_trans(),
+                     breaks = bootstrap.y.breaks,
+                     labels = bootstrap.y.labels)  +
+  scale_color_brewer(palette = 'Dark2', guide = guide_legend(keywidth = 2)) +
+  scale_linetype_manual(values = c('95% confidence' = 'dashed', 
+                                   'all mass movement types' = 'solid'),
+                        guide = guide_legend(override.aes = list(size=1),
+                                             keywidth = 2)) +
+  labs(linetype = '', y = 'p-value', x = 'Days before landslide', color = '') +
+  theme_bw() +
+  theme(legend.position = 'bottom', legend.direction = 'vertical')
+ggsave(file.path(figure.dir, 'pvalues_debrisflow.png'), width = 5, height = 9.5)
+```
+
+```{r}
+calc.signif.timing <- function (slide.regions, precip) {
+  timing <- slide.regions %>%
+    left_join(modis.date %>%
+                filter(burn_years_before >= 0 & burn_years_before < 3) %>%
+                transmute(OBJECTID, 
+                          timing=ifelse(burn_years_before < 1,
+                                        'less than 1 year', 
+                                        '1-3 years')), 
+              by='OBJECTID') %>%
+    mutate(timing = factor(ifelse(is.na(timing), 'unburned', timing),
+                           ordered = T, 
+                           levels = c('less than 1 year', '1-3 years', 
+                                      'unburned')))
+  timing %>%
+    filter(timing != 'unburned') %>%
+    bind_rows(timing %>% 
+                filter(timing=='unburned') %>%
+                mutate(timing = 'less than 1 year')) %>%
+    bind_rows(timing %>% 
+                filter(timing=='unburned') %>%
+                mutate(timing = '1-3 years')) %>%
+    magnitude.regional.data(precip,
+                            groupby = c('region', 'burned', 
+                                        'days_before', 'timing')) %>%
+    group_by(region, days_before, timing) %>%
+    summarize(signif.95 = unique(signif.95),
+              p.value = unique(p.value),
+              total = n())
+}
+
+get.data('burn.wilcox.signif.timing', overwrite = T,
+         calc.signif.timing,
+         slide.regions,
+         precip.chirps.ww.event)
+
+burn.wilcox.signif.timing %>%
+  filter(days_before < 14) %>%
+  group_by(region, timing) %>%
+  summarize(signif.95.days = sum(signif.95))
+```
+
+```{r plot_signif_timing, fig.width = 5, fig.height = 9.5}
+bootstrap.y.breaks <- c(10^-30,  10^-10,  0.05,   0.5,   0.9999)
+bootstrap.y.labels <- c('1e-30', '1e-10', '0.05', '0.5', '1')
+burn.wilcox.signif.timing %>%
+  filter(days_before <14) %>%
+  ggplot() +
+  facet_wrap(facets = 'region', ncol = 1, strip.position = 'right') +
+  geom_line(aes(x = days_before, y = p.value, group = timing, color = timing),
+            size = 1) +
+  geom_line(data = burn.wilcox.regions.event%>%
+              filter(days_before <14) %>%
+              group_by(region, days_before) %>%
+              summarize(p.value = unique(p.value)),
+            aes(x = days_before, y = p.value, linetype = 'all fire timing'),
+            size = 1) +
+  geom_hline(aes(yintercept = 0.05, linetype = '95% confidence')) +
+  geom_vline(aes(xintercept = 0))+
+  geom_label(data = tibble(region = region.plot.order,
+                           label = c('a', 'b', 'c', 'd', 'e', 'f', 'g')) %>%
+               dplyr::mutate(region = factor(region, region.plot.order, ordered = T)),
+             aes(x = -11.5, y = 0.9, label = label), 
+             hjust = 'right', vjust = 'bottom')   +
+  scale_x_reverse()  +
+  scale_y_continuous(trans = probit_trans(),
+                     breaks = bootstrap.y.breaks,
+                     labels = bootstrap.y.labels) +
+  scale_color_brewer(palette = 'Dark2', guide = guide_legend(keywidth = 2)) +
+  scale_linetype_manual(values = c('95% confidence' = 'dashed', 
+                                   'all fire timing' = 'solid'),
+                        guide = guide_legend(override.aes = list(size=1),
+                                             keywidth = 2)) +
+  labs(linetype = '', y = 'p-value', x = 'Days before landslide', color = '') +
+  theme_bw() +
+  theme(legend.position = 'bottom',
+        legend.direction = 'vertical')
+ggsave(file.path(figure.dir, 'pvalues_timing.png'), width = 5, height = 9.5)
+```
+
+## Precipitation (mm) bootstrap sampling
+
+### Bootstrap sampling
+
+```{r bootstrap_functions}
+sample.bootstrap <- function(precip.subset, precip.all, n, samples, burned, region) {
+  precip.all %>%
+    dplyr::filter(burned==burned, region==region) %>%
+    dplyr::mutate(precip.yday = yday(date)) %>%
+    # dplyr::select precipitation from same location and date of year as subset
+    dplyr::inner_join(precip.subset %>% 
+                        dplyr::select(OBJECTID, event_yday), 
+                      by=c('OBJECTID'='OBJECTID', 
+                           'precip.yday'='event_yday')) %>%
+    # Sample precipitation matching the site/day in bulk
+    dplyr::group_by(OBJECTID) %>%
+    tidyr::drop_na(pctl) %>%
+    dplyr::sample_n(n, replace = T) %>%
+    # Randomly split into individual samples
+    dplyr::mutate(i = sample(1:samples, n, replace = T )) 
+}
+
+calc.burn.bootstrap <- function (precip.event, precip.all, 
+                                 samples=100, per.subset=10000,
+                                 pre=30, post=10, w=7) {
+  groupby = c('region', 'burned', 'days_before')
+  precip.all <- precip.all %>% 
+    dplyr::filter(window==w) %>% 
+    dplyr::select(-window)
+  precip.event %>%
+    rename(precip.date = date, precip.yday = yday) %>%
+    dplyr::filter(days_before <= pre, days_before >= -post, window==w) %>%
+    dplyr::select_at(c(groupby, 'OBJECTID', 'event_yday')) %>%
+    # Tally each subset/site/day combination
+    dplyr::group_by_at(groupby) %>%
+    add_tally(name = 'sites.in.subset') %>%
+    # Determine number to draws from each site that will 
+    # roughly match sample sizes among subsets
+    # Round up - number of draws must be an integer
+    dplyr::mutate(n.per.site = ceiling(per.subset / sites.in.subset)) %>%
+    # Take bootstrap samples for each subset/site/day combination
+    dplyr::group_by_at(c(groupby, 'n.per.site', 'sites.in.subset')) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(bootstrap.samples = pmap(list(data, n.per.site, 
+                                                burned, region), 
+                                           ~sample.bootstrap(..1, precip.all, 
+                                                             ..2, samples, 
+                                                             ..3, ..4)))
+}
+```
+
+```{r bootstrap_sample_regions}
+join.details <- function (precip, slide, slide.regions, modis) {
+  precip %>% 
+    dplyr::inner_join(slide %>% dplyr::select(OBJECTID, event_yday), 
+                      by='OBJECTID') %>%
+    dplyr::right_join(slide.regions, by = 'OBJECTID') %>%
+    dplyr::left_join(modis %>% dplyr::select(OBJECTID, burned), 
+                     by='OBJECTID')
+}
+
+get.bootstrap <- function (reg='All landslides', 
+                           name = 'precip.chirps.bootstrap.all', 
+                           ovw=F) {
+  get.data(name, overwrite = ovw,
+           calc.burn.bootstrap,
+           precip.chirps.ww.event %>% 
+             join.details(slide, slide.regions %>% filter(region == reg), modis),
+           precip.chirps.ww.all %>% 
+             join.details(slide, slide.regions %>% filter(region == reg), modis))
+}
+
+get.bootstrap('California', 'precip.chirps.bootstrap.cal', ovw = F)
+get.bootstrap('Intermountain West', 'precip.chirps.bootstrap.imw', ovw = F)
+get.bootstrap('Pacific Northwest', 'precip.chirps.bootstrap.pnw', ovw = F)
+get.bootstrap('Central America', 'precip.chirps.bootstrap.cam', ovw = F)
+get.bootstrap('Himalayas', 'precip.chirps.bootstrap.him', ovw = F)
+get.bootstrap('Southeast Asia', 'precip.chirps.bootstrap.sea', ovw = F)
+get.bootstrap(ovw = F)
+
+precip.chirps.bootstrap <- precip.chirps.bootstrap.all %>%
+  dplyr::bind_rows(precip.chirps.bootstrap.cal) %>%
+  dplyr::bind_rows(precip.chirps.bootstrap.imw) %>%
+  dplyr::bind_rows(precip.chirps.bootstrap.pnw) %>%
+  dplyr::bind_rows(precip.chirps.bootstrap.cam) %>%
+  dplyr::bind_rows(precip.chirps.bootstrap.him) %>%
+  dplyr::bind_rows(precip.chirps.bootstrap.sea)
+
+precip.chirps.bootstrap %>%
+  dplyr::filter(days_before==0) %>%
+  dplyr::select(-data) %>%
+  dplyr::mutate(site.total = map_int(bootstrap.samples, ~nrow(ungroup(.))),
+                n.per.site.real = site.total / sites.in.subset,
+                avg.sample.size = map_dbl(bootstrap.samples, 
+                                          ~group_by(., i) %>% 
+                                            summarize(n = n()) %>% 
+                                            pull(n) %>% mean)) %>%
+  dplyr::select(-bootstrap.samples)
+```
+
+### Summarize bootstrap samples
+```{r bootstrap_mann_whitney, class.source = 'fold.show'}
+mann.whitney.p.value <- function (subset, bootstrap) {
+  bootstrap %>%
+    dplyr::group_by(i) %>%
+    tidyr::nest() %>%
+    # test if bootstrap samples are less than pre-landslide precipitation
+    dplyr::mutate(wilcox = map(data,
+                               ~wilcox.test(pull(., pctl), 
+                                            pull(subset, pctl), 
+                                            alternative='less'))) %>% 
+    dplyr::mutate(wilcox.glance = map(wilcox, glance)) %>%
+    dplyr::select(-data, -wilcox) %>%
+    tidyr::unnest(wilcox.glance)
+}
+```
+
+```{r subset_precip}
+subset.precip <- function (precip, regions, modis, w=7, pre=30, post=10) {
+  precip %>%
+    dplyr::filter(window==7, days_before <= pre, days_before >= -post) %>%
+    dplyr::select(OBJECTID, pctl, days_before) %>%
+    dplyr::right_join(regions, by='OBJECTID') %>%
+    dplyr::inner_join(modis, by='OBJECTID') %>%
+    dplyr::group_by(region, burned, days_before) %>%
+    tidyr::nest()
+}
+
+get_subset <- function (reg, bur, day, subsets) {
+  row <- subsets %>%
+    dplyr::filter(region==as.character(reg),
+                  burned==bur,
+                  days_before==day)
+  row$data[[1]]
+}
+
+get.data('precip.chirps.ww.event.subsets', 
+         subset.precip,
+         precip.chirps.ww.event,
+         slide.regions,
+         modis)
+```
+
+```{r summarize_bootstrap} 
+summarize.bootstrap <- function (bootstrap.df, subsets, objective.function) {
+  bootstrap.df %>%
+    dplyr::mutate(objective = purrr::pmap(list(region, 
+                                               burned, 
+                                               days_before,
+                                               bootstrap.samples), 
+                                          ~objective.function(get_subset(..1, 
+                                                                         ..2, 
+                                                                         ..3, 
+                                                                         subsets),
+                                                              ..4))) %>%
+    dplyr::select(-bootstrap.samples) %>%
+    tidyr::unnest(objective) %>%
+    dplyr::ungroup()
+}
+```
+
+
+
+```{r summarize_bootstrap_wilcox}
+get.data('precip.chirps.bootstrap.wilcox', overwrite = F,
+         summarize.bootstrap,
+         precip.chirps.bootstrap %>% dplyr::select(-data),
+         precip.chirps.ww.event.subsets,
+         mann.whitney.p.value)
+precip.chirps.bootstrap.wilcox %>% 
+  dplyr::select(region, burned, days_before, p.value)
+```
+
+### Plot bootstrap sampling
+```{r bootstrap_wilcox, fig.width=11, fig.height=11, fig.show='hide'}
+plot.burn.bootstrap <- function (bootstrap, var, name) {
+  bootstrap %>%
+    ggplot()  +
+    facet_wrap(.~region, ncol=1, strip.position='right') +
+    geom_vline(aes(xintercept=0)) +
+    geom_boxplot(aes(x = days_before, 
+                     group = interaction(days_before, burned), 
+                     y = {{ var }}, 
+                     fill = burned,
+                     color = burned),
+                 outlier.shape=21,
+                 alpha = 0.6,
+                 position = position_dodge(width=0.4, preserve = 'total'))  +
+    annotate("rect", xmin = -11, xmax = -0.1, ymin = 0.05, ymax = .9999, 
+             fill = 'white', alpha = 0.4) +
+    annotate("rect", xmin = 0.1, xmax = 31, ymin = 0.05, ymax = .9999, 
+             fill = 'white', alpha = 0.4)  +
+    geom_hline(aes(yintercept=0.05), linetype='dashed') +
+    geom_label(data = tibble(region = region.plot.order,
+                             label = c('a', 'b', 'c', 'd', 'e', 'f', 'g')) %>%
+                 dplyr::mutate(region = factor(region, region.plot.order, ordered = T)),
+               aes(x = -11.5, y = 0.9999, label = label), 
+               hjust = 'right', vjust = 'bottom')  +
+    scale_x_reverse(expand = expansion(), limits = c(31, -12)) +
+    scale_y_continuous(trans = probit_trans(),
+                       breaks = bootstrap.y.breaks,
+                       labels = bootstrap.y.labels) +
+    scale_fill_burned +
+    scale_color_burned +
+    coord_trans(y = 'reverse', 
+                ylim = c(10^-35, .9999)) +
+    theme_bw() +
+    labs(x='Days before the landslide', y=name) +
+    theme(legend.position = 'bottom',
+          panel.grid.minor.y = element_blank())
+}
+
+bootstrap.y.breaks <- c(10^-30,  10^-10,  0.05,   0.5, 0.9, 0.9999)
+bootstrap.y.labels <- c('1e-30', '1e-10', '0.05', '0.5', '0.9', '1')
+plot.bootstrap.wilcox <- precip.chirps.bootstrap.wilcox %>%
+  plot.burn.bootstrap(p.value, 
+                      'p-value of Mann-Whitney tests between bootstrap samples and pre-landslide precipitation') 
+
+plot.bootstrap.wilcox
+```
+
+```{r sample_kde, fig.width = 4, fig.height = 11, fig.show='hide'}
+plot.bootstrap.sample.kde <- precip.chirps.bootstrap %>%
+  dplyr::filter(days_before==0) %>%
+  dplyr::select(-data) %>%
+  tidyr::unnest() %>%
+  ggplot() +
+  facet_grid(cols = vars(burned), rows = vars(region), scales = 'free_y') +
+  geom_density(aes(x = pctl, group = i, color = burned, fill = burned), 
+               alpha = 0.01) +
+  geom_density(data = precip.chirps.ww.event %>% 
+                 filter(days_before==0) %>% 
+                 right_join(slide.regions, by = 'OBJECTID')%>%
+                 inner_join(modis, by='OBJECTID'),
+               aes(x = pctl, color = 'day_of', fill = 'day_of'), 
+               alpha = 0.2, size = 1) +
+  geom_label(data = cross_df(list(region = region.plot.order, 
+                                  burned = c('burned', 'unburned'))) %>%
+               dplyr::mutate(label = c('h', 'i', 'j', 'k', 'l', 'm', 'n', 
+                                       'o', 'p', 'q', 'r', 's', 't', 'u')) %>%
+               dplyr::mutate(region = factor(region, region.plot.order, ordered = T)),
+             aes(x = .95, y = .05, label = label), 
+             hjust = 'right', vjust = 'bottom') +
+  scale_fill_manual('',
+                    breaks = c('day_of', 'burned', 'unburned'),
+                    values = c('day_of' = NA, burned.colors),
+                    labels = c('day_of' = 'Day of landslide precipitation',
+                               'burned' = 'Bootstrap samples, burned sites',
+                               'unburned' = 'Bootstrap samples, unburned sites'),
+                    guide = guide_legend(override.aes = list(alpha = 0.5))) +
+  scale_color_manual('', 
+                     breaks = c('day_of', 'burned', 'unburned'),
+                     values = c('day_of' = 'black', burned.colors),
+                     labels = c('day_of' = 'Day of landslide precipitation',
+                                'burned' = 'Bootstrap samples, burned sites',
+                                'unburned' = 'Bootstrap samples, unburned sites'),
+                    guide = guide_legend(override.aes = list(alpha = 0.5))) +
+  scale_x_continuous(breaks = seq(0, 1, 0.25),
+                     labels = c('0', '0.25', '0.5', '0.75', '1')) +
+  labs(y = 'Kernel density estimate', x = 'Precipitation percentile') +
+  theme_bw() +
+  theme(legend.position = 'bottom',
+        legend.spacing.x = unit(15, "pt"),
+        #axis.text.y = element_blank(),
+        axis.text.x = element_text(),
+        #axis.ticks.y = element_blank(),
+        strip.text.x = element_blank(),
+        panel.spacing.x = unit(15, 'pt')) +
+  coord_cartesian(expand = F)
+plot.bootstrap.sample.kde
+```
+
+```{r plot_bootstrap_wilcox_kde, fig.width = 13, fig.height = 11}
+plot.bootstrap.sample.kde.legend <- get_legend(plot.bootstrap.sample.kde)
+plot.bootstrap.wilcox.legend <- get_legend(plot.bootstrap.wilcox)
+cowplot::plot_grid(cowplot::plot_grid(plot.bootstrap.wilcox + 
+                      theme(strip.text = element_blank(),
+                            plot.margin = unit(c(5,5,5,5), 'pt'),
+                            legend.position = 'none',
+                            legend.direction = 'horizontal'), 
+                    plot.bootstrap.sample.kde + 
+                      theme(plot.margin = unit(c(5,5,5,2), 'pt'),
+                            legend.position = 'none'),
+                    rel_widths = c(11, 4)),
+          cowplot::plot_grid(plot.bootstrap.wilcox.legend, 
+                    plot.bootstrap.sample.kde.legend,
+                    rel_widths = c(3, 7)),
+          nrow = 2, rel_heights = c(10, 0.5))
+
+ggsave(file.path(figure.dir, 'precip_bootstrap_wilcox+kde.png'), width=13, height=11)
+```
+
+
+## Seasonal density
+
+```{r seasons_by_region_polar, fig.width=2.5, fig.height=11, fig.show='hide'}
+slide.season <- slide %>%
+  dplyr::select(OBJECTID, location_accuracy, season, event_yday) %>%
+  dplyr::right_join(slide.regions, by='OBJECTID') %>%
+  dplyr::left_join(modis, by='OBJECTID')
+
+plot.seasonality <- bind_rows(slide.season %>% 
+                                dplyr::mutate(event_yday = event_yday - 365),
+                              slide.season,
+                              slide.season %>% 
+                                dplyr::mutate(event_yday = event_yday + 365)) %>%
+  dplyr::group_by(region, burned) %>%
+  tidyr::drop_na(burned) %>%
+  tidyr::nest() %>%
+  dplyr::mutate(kde = map(data, 
+                          function (df) density(df$event_yday, 
+                                                from=-100, to=450, 
+                                                n = 512, bw = 21)),
+                kde = map(kde, function (dens) tibble(event_yday = dens$x, 
+                                                      density = dens$y))) %>%
+  tidyr::unnest(kde) %>%
+  dplyr::filter(event_yday >= 0, event_yday < 365) %>%
+  ggplot() +
+  facet_wrap(region~., ncol = 1, strip.position = 'right') +
+  geom_area(aes(x = event_yday, y = density, group = burned, fill=burned),
+            trim = T, alpha = 0.6, color = 'black', 
+            position = position_identity()) +
+  geom_text(data = tibble(text = c('h', 'i', 'j', 'k', 'l', 'm', 'n'),
+                          hjust = c(-3.5, -10, -10, -4, -10, -2, -3.5),
+                          region = region.plot.order,
+                          x = -2.1*365, y = 0.50) %>%
+               mutate(region = factor(region, region.plot.order, ordered = T)),
+            aes(x = 0, y = .0035, label = text, hjust = hjust), size = 7) +
+  coord_polar() +
+  scale_fill_burned +
+  scale_x_continuous(breaks = (season.breaks + 365/8) %% 365,
+                     labels = c('W', 'Sp', 'Su', 'F'),
+                     minor_breaks = season.breaks) +
+  labs(y = '', x = ' ', fill = 'Season') +
+  theme_bw() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 0, vjust = 1),
+        legend.position = 'bottom',
+        panel.grid.minor.x = element_line(color = 'black'))
+
+plot.seasonality
+```
+
+## Precipitation frequency
+
+```{r calc_regional_frequency}
+n.years <- 2
+calc.prop <- function (col) sum(!(col %in% 0)) / n()
+calc.yday.frequency <- function (precip, slide, slide.regions, modis) {
+  precip %>%
+  dplyr::mutate(precip_yday = yday(date)) %>% 
+  dplyr::select(OBJECTID, precip_yday, pctl) %>%
+  dplyr::inner_join(slide %>% dplyr::select(OBJECTID, event_yday), 
+                    by='OBJECTID') %>%
+  dplyr::mutate(ydays_before = event_yday - precip_yday) %>%
+  dplyr::select(OBJECTID, ydays_before, pctl) %>%
+  dplyr::mutate(ydays_before = ydays_before %% 365) %>%
+  dplyr::right_join(slide.regions, by = 'OBJECTID') %>%
+  dplyr::left_join(modis %>% dplyr::select(OBJECTID, burned), 
+                   by='OBJECTID') %>%
+  dplyr::group_by(region, burned, ydays_before) %>%
+  dplyr::summarize_at(vars(pctl), list(precip.yday.freq = calc.prop))
+}
+ 
+get.data('precip.chirps.yday.frequency',
+         calc.yday.frequency,
+         precip.chirps.ww.all,
+         slide,
+         slide.regions,
+         modis)
+
+calc.frequency <- function (precip, precip.yday.freq, 
+                            slide, slide.regions, modis) {
+  precip.chirps.ww.all %>%
+    dplyr::transmute(OBJECTID, date = lubridate::as_date(date), pctl) %>%
+    dplyr::inner_join(slide %>% dplyr::select(OBJECTID, event_date), 
+                      by='OBJECTID') %>%
+    dplyr::mutate(days_before = as.integer(event_date - date)) %>%
+    dplyr::select(OBJECTID, days_before, pctl) %>%
+    dplyr::filter(days_before < n.years * 365, 
+                  days_before > -n.years * 365) %>%
+    dplyr::right_join(slide.regions, by = 'OBJECTID') %>%
+    dplyr::left_join(modis %>% dplyr::select(OBJECTID, burned), 
+                     by='OBJECTID') %>%
+    dplyr::group_by(region, burned, days_before) %>%
+    dplyr::summarize_at(vars(pctl), list(precip.day.freq = calc.prop)) %>%
+    dplyr::mutate(ydays_before = days_before %% 365) %>%
+    dplyr::left_join(precip.yday.freq, by=c('region', 'ydays_before', 'burned')) %>%
+    dplyr::mutate(precip.freq.norm  = precip.day.freq / precip.yday.freq,
+                  precip.freq.anomaly = precip.day.freq - precip.yday.freq,
+                  precip.freq.lt.anomaly = precip.day.freq - mean(precip.day.freq),
+                  precip.freq.std = precip.freq.lt.anomaly / sd(precip.day.freq)) %>%
+    dplyr::ungroup()
+}
+get.data('precip.chirps.frequency', overwrite = T,
+         calc.frequency,
+         precip.chirps.ww.all,
+         precip.chirps.yday.frequency,
+         slide,
+         slide.regions,
+         modis)
+```
+
+```{r precip_frequency, fig.width=10, fig.height=12, fig.show='hide'}
+plot.frequency <- function (data, column, y.lable, n.years, groupby=c('burned')) {
+  data %>%
+    dplyr::group_by_at(groupby) %>%
+    dplyr::mutate(smooth = rollmean(!!as.name(column), 90, na.pad=TRUE)) %>%
+    ggplot() +
+    geom_line(aes(x = days_before, y = !!as.name(column), 
+                  group = burned, color = burned, size = 'daily')) +
+    geom_line(aes(x = days_before, y = smooth, group = burned, color = burned, 
+                  size = 'rolling')) +
+    geom_hline(data = data %>% 
+                 dplyr::group_by_at(groupby) %>% 
+                 summarize(mean = mean(!!as.name(column))),
+               aes(yintercept = mean, color=burned), linetype = 'dashed') +
+    geom_text(data = tibble(text = c('a', 'b', 'c', 'd', 'e', 'f', 'g'),
+                            region = region.plot.order,
+                            x = -1.95*365, y = 0.50),
+              aes(x = x, y = y, label = text), size = 7,
+              hjust = 'right') +
+    scale_size_manual('',
+                      values = c('daily' = 0.1, 'rolling' = 0.75),
+                      labels = c('daily' = 'Daily frequency', 
+                                 'rolling' = '90-day rolling average')) +
+    scale_color_manual('', 
+                      values = c('burned' = '#d95f02', unburned = '#7570b3'),
+                      labels = c('burned'='Burned', 'unburned'='Unburned'),
+                      guide = guide_legend(override.aes = list(size = 2))) +
+    scale_x_reverse('Years before the landslide', 
+                    breaks = seq(-365 * n.years, 365 * n.years, 365),
+                    labels = function (breaks) breaks / 365,
+                    expand = expansion()) +
+    labs(y = y.lable) +
+    theme_bw() +
+    theme(legend.position = 'bottom')
+}
+
+plot.frequency.region <- precip.chirps.frequency %>%
+  plot.frequency('precip.freq.std', 
+                 'Precipitation frequency anomaly - long-term mean',
+                 n.years=n.years, 
+                 groupby=c('burned', 'region')) +
+  facet_wrap(region~., ncol=1, strip.position = 'right')
+plot.frequency.region
+```
+
+```{r plot_precip_frequency_seasonality, fig.width=12.5, fig.height=12}
+cowplot::plot_grid(
+  cowplot::plot_grid(
+    plot.frequency.region + 
+      theme(strip.text.y = element_blank(),
+            legend.position = 'none',
+            plot.margin = unit(c(5, 1, 5, 5), 'pt')),
+    plot.seasonality +
+      theme(legend.position = 'none',
+            plot.margin = unit(c(5, 5, 12, 0), 'pt')),
+    rel_widths = c(10, 2.5)
+  ),
+  get_legend(plot.frequency.region),
+  nrow = 2, rel_heights = c(10, 0.5)
+)
+
+ggsave(file.path(figure.dir, 'precip_frequency_seasonality.png'), width=11, height=12)
+```
+
+```{r fig.width=2.5, fig.height = 10}
+precip.dayof <- precip.chirps.ww.event %>%
+  filter(window==7, days_before==-1) %>%
+  select(OBJECTID, pctl) %>%
+  right_join(slide.regions, by='OBJECTID') %>%
+  left_join(slide %>% 
+              transmute(OBJECTID, 
+                        debris_flow = ifelse(debris_flow, 'Debris flow', 'Other'),
+                        location_accuracy = ifelse(location_accuracy <= '1km',
+                                                   'high accuracy', 
+                                                   'low accuracy')), 
+            by='OBJECTID') %>%
+  left_join(modis.date %>%
+               filter(burn_years_before >= 0 & burn_years_before < 3) %>%
+               transmute(OBJECTID, 
+                         gt_1year=ifelse(burn_years_before < 1,
+                                         'less than 1 year', 
+                                         '1-3 years')), 
+            by='OBJECTID') %>%
+  mutate(burned = ifelse(is.na(gt_1year), 'unburned', 'burned'),
+         gt_1year = factor(ifelse(is.na(gt_1year), burned, gt_1year),
+                           ordered = T, 
+                           levels = c('less than 1 year', '1-3 years', 
+                                      'unburned')))
+
+precip.dayof %>%
+  ggplot() +
+  facet_grid( rows = vars(region)) +
+  geom_boxplot(aes(y = pctl, x = gt_1year, group = gt_1year, fill = burned)) +
+  geom_label(data = tibble(region = region.plot.order,
+                           label = c('a', 'b', 'c', 'd', 'e', 'f', 'g')) %>%
+               dplyr::mutate(region = factor(region, region.plot.order, ordered = T)),
+             aes(x = 3.5, y = 0, label = label), 
+             hjust = 'right', vjust = 'bottom') +
+scale_fill_burned +
+  labs(y= 'Precipitation percentile', x = '') +
+  theme_bw() +
+  theme(legend.position = 'bottom',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(file.path(figure.dir, 'timing_dolprecip.png'), width = 2.5, height = 10)
+```
+
+```{r fig.width=3, fig.height=9.5}
+
+precip.dayof %>%
+  ggplot() +
+  facet_grid(cols = vars(location_accuracy), rows = vars(region)) +
+  geom_boxplot(aes(group = burned, 
+                   fill = burned,
+                   y = pctl)) +
+  scale_fill_burned +
+  theme_bw() +
+  theme(legend.position = 'bottom',
+        axis.text.x = element_text(angle = 90))
+```
+
+```{r fig.width=3, fig.height=9.5}
+
+precip.dayof %>%
+  ggplot() +
+  facet_grid(cols = vars(debris_flow), rows = vars(region)) +
+  geom_boxplot(aes(group = burned, 
+                   fill = burned,
+                   y = pctl)) +
+  scale_fill_burned +
+  theme_bw() +
+  theme(legend.position = 'bottom',
+        axis.text.x = element_text(angle = 90))
+```

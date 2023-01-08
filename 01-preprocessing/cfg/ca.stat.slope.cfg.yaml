@@ -1,0 +1,87 @@
+project_id: stat
+basin_id: ca_slope
+log_level: !!python/name:logging.INFO
+verbose: true
+base_dir: /Users/elsaculler/Documents/landslide/stat
+temp_dir: tmp
+
+input:
+#  dem: !Tiles
+#    dirname: /Volumes/LabShare/Global/SRTMv3/hgt
+#    bbox: [-125, 32, -114, 43]
+#    filename_fmt: '{cardinal_lat}{abs_min_lat}{cardinal_lon}{abs_min_lon:03d}'
+#    default_ext: hgt
+#  dem: !Tiles
+#    dirname: data/dem/agg
+#    bbox: [-125, 32, -114, 43]
+#    filename_fmt: '{cardinal_lat}{abs_min_lat}{cardinal_lon}{abs_min_lon:03d}_scaled-dem_aggregated_0-00028x0-00028'
+#    default_ext: gtif
+#  reprojected: !Tiles
+#    dirname: data/slope/albers
+#    bbox: [-125, 32, -114, 43]
+#    filename_fmt: '{cardinal_lat}{abs_min_lat}{cardinal_lon}{abs_min_lon:03d}_reprojected_reprojected_0-00028x0-00028'
+ #   default_ext: gtif
+  slope: !Tiles
+    dirname: data/slope/full
+    bbox: [-125, 32, -114, 43]
+    filename_fmt: '{cardinal_lat}{abs_min_lat}{cardinal_lon}{abs_min_lon:03d}_reprojected_reprojected_0-00028x0-00028_slope_slope'
+    default_ext: gtif
+  projslope: !Tiles
+    dirname: data/slope/wgs
+    bbox: [-125, 32, -114, 43]
+    filename_fmt: '{cardinal_lat}{abs_min_lat}{cardinal_lon}{abs_min_lon:03d}_reprojected_reprojected_0-00028x0-00028_slope_slope_reprojected_reprojected'
+    default_ext: gtif
+  #clay: !Tiles
+  #  dirname: data/clay/full/0_5
+  #  bbox: [-125, 32, -114, 43]
+  #  filename_fmt: 'lat{min_lat}{max_lat}_lon{min_lon}{max_lon}'
+  #  default_ext: tif
+  res: !Coord {x: 0.05, y: 0.05}
+  grid-res: !Coord {x: 1.0, y: 1.0}
+  proj: EPSG:4326 #5070
+cases:
+  base: !BaseCase {}
+operations:
+#  - operation: reproject
+#    in:
+#      input-ds: dem
+#      proj: proj
+#    out:
+#      reprojected: reprojected
+#    many:
+#      - input-ds
+#  - operation: slope
+#    in:
+#       elevation-ds: reprojected
+#    out:
+#      slope: slope
+#    many:
+#      - elevation-ds
+#  - operation: reproject
+#    in:
+#      input-ds: slope
+#      proj: proj
+#    out:
+#      reprojected: reprojected
+#    many:
+#      - input-ds
+  - operation: agg
+    in:
+      input-ds: projslope
+      resolution: res
+      grid-res: grid-res
+      algorithm: max
+    out:
+      scaled-raster: scaled-dem
+    many:
+      - input-ds
+#  - operation: merge
+#    in:
+#      raster-list: dem
+#    out:
+#      merged: merged-dem
+structure: !CaseDirectoryStructure
+  idstr: hotspots
+  paths:
+    '{basin_id}':
+      '{case_id}':
