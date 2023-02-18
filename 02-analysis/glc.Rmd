@@ -104,10 +104,10 @@ processed.data.dir = file.path(data.dir, 'processed')
 figure.dir <- file.path('..', '03-figures')
 
 # Landslide data from the NASA Global Landslide Catalog
-slide.path <- file.path(raw.data.dir, 'glc', 'GLC20180821.csv')
+slide.path <- file.path(raw.data.dir, 'glc', 'GLC20201204.csv')
 
 # Fire data from the MODIS Burned Area dataset
-modis.paths <- list.files(path = file.path(data.dir, "processed"),
+modis.paths <- list.files(path = processed.data.dir,
                           pattern = 'slide_modisburndate_[ns][ew].csv',
                           full.names = T)
 
