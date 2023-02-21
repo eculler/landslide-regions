@@ -21,7 +21,7 @@ This analysis uses the following data preprocessed to extract values at landslid
     - Thornton, M.M., R. Shrestha, Y. Wei, P.E. Thornton, S-C. Kao, and B.E. Wilson. 2022. Daymet: Daily Surface Weather Data on a 1-km Grid for North America, Version 4 R1. ORNL DAAC, Oak Ridge, Tennessee, USA. https://doi.org/10.3334/ORNLDAAC/2129
     - Data accessed from the [Oak Ridge National Laboratory DAAC](https://daac.ornl.gov/cgi-bin/dsviewer.pl?ds_id=2129)
   
-The preprocessed dataset are available from zenodo at DOI 10.5281/zenodo.7653639 and should be placed in `00-data` > `processed` to runthe `02-analysis` > `glc.Rmd` notebook  without modifications
+The [preprocessed dataset are available from zenodo](https://doi.org/10.5281/zenodo.7653639) and should be placed in `00-data` > `processed` to runthe `02-analysis` > `glc.Rmd` notebook  without modifications
 
 ## To run:
 
